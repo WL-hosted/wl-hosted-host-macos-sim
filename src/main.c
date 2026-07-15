@@ -217,8 +217,8 @@ static bool disconnected(app_t *app) { return app->disconnected; }
 static int run_scenario(app_t *app, const char *scenario)
 {
     wlh_wifi_scan_params_t scan = {1u, NULL, 0u, true, 8u};
-    static const uint8_t ssid[] = "Lab-WPA2";
-    static const uint8_t credential[] = "password";
+    static const uint8_t ssid[] = "WPA2Net";
+    static const uint8_t credential[] = "password123";
     wlh_wifi_connect_params_t connect = {ssid, sizeof(ssid) - 1u, credential,
                                          sizeof(credential) - 1u, 4u, 3000u};
     uint8_t ethernet[60] = {0x02, 0, 0, 0, 0, 2, 0x02, 0, 0, 0, 0, 1};
