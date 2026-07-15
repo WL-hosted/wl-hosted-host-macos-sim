@@ -1,0 +1,3 @@
+[submodule "host-core"]
+	path = host-core
+	url = https://github.com/WL-hosted/wl-hosted-host-core.git
