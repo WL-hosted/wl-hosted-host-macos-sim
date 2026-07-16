@@ -18,6 +18,14 @@ static void signal_callback(void *argument) {
            ) == 0);
 }
 
+static void wait_callback(void *argument) {
+    callback_context_t *context = argument;
+    assert(context->ops->semaphore_take(
+               context->ops->context, context->semaphore,
+               WLH_OSAL_WAIT_FOREVER
+           ) == 0);
+}
+
 int main(void) {
     wlh_posix_osal_t posix;
     wlh_osal_ops_t ops;
@@ -41,6 +49,7 @@ int main(void) {
 
     assert(ops.mutex_create(ops.context, &mutex) == 0);
     assert(ops.mutex_lock(ops.context, &mutex, 100u) == 0);
+    assert(ops.mutex_lock(ops.context, &mutex, 10u) != 0);
     ops.mutex_unlock(ops.context, &mutex);
     ops.mutex_destroy(ops.context, &mutex);
 
@@ -74,6 +83,13 @@ int main(void) {
                ops.context, &task, NULL, signal_callback, &callback
            ) == 0);
     assert(ops.semaphore_take(ops.context, &semaphore, 500u) == 0);
+    assert(ops.task_join(ops.context, &task, 500u) == 0);
+
+    assert(ops.task_create(
+               ops.context, &task, NULL, wait_callback, &callback
+           ) == 0);
+    assert(ops.task_join(ops.context, &task, 10u) != 0);
+    assert(ops.semaphore_give(ops.context, &semaphore) == 0);
     assert(ops.task_join(ops.context, &task, 500u) == 0);
 
     assert(ops.timer_create(

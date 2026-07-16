@@ -23,6 +23,7 @@ typedef struct app {
 
     pthread_t rx_thread;
     pthread_mutex_t state_mutex;
+    pthread_cond_t state_changed;
 
     atomic_bool running;
     atomic_uint fail_allocations;
@@ -44,6 +45,11 @@ typedef struct tx_work {
     void *completion_context;
 } tx_work_t;
 
+typedef struct lifecycle_work {
+    wlh_transport_lifecycle_complete_fn completion;
+    void *completion_context;
+} lifecycle_work_t;
+
 static atomic_bool interrupted = false;
 
 static uint64_t monotonic_ms(void) {
@@ -56,13 +62,38 @@ static void signal_handler(int signal_number) {
     (void)signal_number;
     interrupted = true;
 }
-static int transport_start(void *context) {
-    (void)context;
+static void lifecycle_work_run(void *context) {
+    lifecycle_work_t *work = context;
+    work->completion(work->completion_context, 0);
+    free(work);
+}
+
+static int submit_lifecycle(
+    app_t *app, wlh_transport_lifecycle_complete_fn completion,
+    void *completion_context
+) {
+    lifecycle_work_t *work = malloc(sizeof(*work));
+    if (work == NULL)
+        return -1;
+    *work = (lifecycle_work_t){completion, completion_context};
+    if (sim_executor_post(&app->tx_executor, lifecycle_work_run, work) != 0) {
+        free(work);
+        return -1;
+    }
     return 0;
 }
-static int transport_stop(void *context) {
-    (void)context;
-    return 0;
+
+static int transport_start(
+    void *context, wlh_transport_lifecycle_complete_fn completion,
+    void *completion_context
+) {
+    return submit_lifecycle(context, completion, completion_context);
+}
+static int transport_stop(
+    void *context, wlh_transport_lifecycle_complete_fn completion,
+    void *completion_context
+) {
+    return submit_lifecycle(context, completion, completion_context);
 }
 static void tx_work_run(void *context) {
     tx_work_t *work = context;
@@ -119,6 +150,7 @@ static void completion(
     (void)payload_size;
     pthread_mutex_lock(&app->state_mutex);
     app->completions++;
+    pthread_cond_broadcast(&app->state_changed);
     pthread_mutex_unlock(&app->state_mutex);
     fprintf(
         stderr,
@@ -140,6 +172,7 @@ static void host_event(void *context, const wlh_host_event_t *event) {
         app->disconnected = true;
     if (event->kind == WLH_HOST_EVENT_ETHERNET_STA_RX)
         app->ethernet_rx = true;
+    pthread_cond_broadcast(&app->state_changed);
     pthread_mutex_unlock(&app->state_mutex);
     fprintf(
         stderr,
@@ -312,7 +345,17 @@ static void *rx_main(void *context) {
         free(payload);
     }
     atomic_store(&app->running, false);
+    pthread_mutex_lock(&app->state_mutex);
+    pthread_cond_broadcast(&app->state_changed);
+    pthread_mutex_unlock(&app->state_mutex);
     return NULL;
+}
+
+static struct timespec relative_duration_ms(uint64_t duration_ms) {
+    struct timespec duration;
+    duration.tv_sec = (time_t)(duration_ms / 1000u);
+    duration.tv_nsec = (long)(duration_ms % 1000u) * 1000000L;
+    return duration;
 }
 
 static bool wait_until(
@@ -320,27 +363,43 @@ static bool wait_until(
 ) {
     uint64_t deadline = monotonic_ms() + timeout_ms;
     uint64_t next_monitor = 0u;
-    while (atomic_load(&app->running) && !atomic_load(&interrupted) &&
-           monotonic_ms() < deadline) {
-        bool done;
-        pthread_mutex_lock(&app->state_mutex);
+    bool done = false;
+
+    pthread_mutex_lock(&app->state_mutex);
+    while (atomic_load(&app->running) && !atomic_load(&interrupted)) {
+        uint64_t now = monotonic_ms();
+        uint64_t wake_at;
+        struct timespec native_duration;
         done = predicate(app);
-        pthread_mutex_unlock(&app->state_mutex);
-        if (done)
-            return true;
-        if (monotonic_ms() >= next_monitor) {
+        if (done || now >= deadline)
+            break;
+        if (now >= next_monitor) {
+            pthread_mutex_unlock(&app->state_mutex);
             send_runtime(app);
-            next_monitor = monotonic_ms() + app->monitor_interval_ms;
+            now = monotonic_ms();
+            next_monitor = now + app->monitor_interval_ms;
+            pthread_mutex_lock(&app->state_mutex);
         }
-        usleep(10000u);
+        wake_at = deadline < next_monitor ? deadline : next_monitor;
+        now = monotonic_ms();
+        native_duration = relative_duration_ms(
+            wake_at > now ? wake_at - now : 0u
+        );
+        (void)pthread_cond_timedwait_relative_np(
+            &app->state_changed, &app->state_mutex, &native_duration
+        );
     }
-    return false;
+    pthread_mutex_unlock(&app->state_mutex);
+    return done;
 }
 
 static bool ready(app_t *app) {
     wlh_host_diagnostics_t diagnostics;
     wlh_host_get_diagnostics(&app->host, &diagnostics);
     return diagnostics.state == WLH_HOST_STATE_READY;
+}
+static bool not_ready(app_t *app) {
+    return !ready(app);
 }
 static bool one_completion(app_t *app) {
     return app->completions >= 1u;
@@ -371,6 +430,12 @@ static int run_scenario(app_t *app, const char *scenario) {
         return -1;
     if (strcmp(scenario, "smoke") == 0)
         return 0;
+    if (strcmp(scenario, "recovery") == 0) {
+        wlh_host_transport_lost(&app->host);
+        if (!wait_until(app, not_ready, 2000u))
+            return -1;
+        return wait_until(app, ready, 5000u) ? 0 : -1;
+    }
 
     app->completions = 0u;
     (void)wlh_host_wifi_initialize(&app->host, completion, app);
@@ -380,6 +445,8 @@ static int run_scenario(app_t *app, const char *scenario) {
     (void)wlh_host_wifi_scan(&app->host, &scan, completion, app);
     if (!wait_until(app, scan_complete, 3000u))
         return -1;
+    if (strcmp(scenario, "scan") == 0)
+        return 0;
 
     (void)wlh_host_wifi_connect(&app->host, &connect, completion, app);
     if (!wait_until(app, connected, 4000u))
@@ -438,6 +505,7 @@ int main(int argc, char **argv) {
     signal(SIGINT, signal_handler);
     signal(SIGTERM, signal_handler);
     if (pthread_mutex_init(&app.state_mutex, NULL) != 0 ||
+        pthread_cond_init(&app.state_changed, NULL) != 0 ||
         sim_executor_start(&app.executor) != 0 ||
         sim_executor_start(&app.tx_executor) != 0 ||
         sim_ipc_open(&app.ipc, endpoint) != 0) {
@@ -463,7 +531,6 @@ int main(int argc, char **argv) {
 
     config.max_frame_size = 4096u;
     config.rpc_timeout_ms = rpc_timeout_ms;
-    config.heartbeat_interval_ms = 1000u;
     config.heartbeat_timeout_ms = 5000u;
     config.max_pending_rpc = 8u;
     config.core_queue_depth = 16u;
@@ -488,6 +555,7 @@ int main(int argc, char **argv) {
     sim_ipc_close(&app.ipc);
     pthread_join(app.rx_thread, NULL);
     sim_executor_stop(&app.executor);
+    pthread_cond_destroy(&app.state_changed);
     pthread_mutex_destroy(&app.state_mutex);
 
     return result == 0 ? 0 : 1;
