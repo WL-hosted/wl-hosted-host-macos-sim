@@ -1,3 +1,3 @@
 host-core.url=https://github.com/WL-hosted/wl-hosted-host-core.git
-host-core.commit=0961a579f6623fbcecf6b153121fcf84ec60d19d
+host-core.commit=cea3ae90efaa5c205eecfb87468a57a80e867234
 protocol.transitive.commit=f222469f1dc871f2260f1bbcb8811cadf44792de
