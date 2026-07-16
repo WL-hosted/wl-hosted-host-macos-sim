@@ -11,8 +11,10 @@ set(BUILD_TESTING ${WLH_SIM_BUILD_TESTING})
 
 target_compile_definitions(wlh_host_core PRIVATE WLH_ENABLE_TEST_HOOKS)
 
-add_library(wlh_host_sim_platform STATIC src/ipc.c src/executor.c)
-target_include_directories(wlh_host_sim_platform PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
+add_library(wlh_host_sim_platform STATIC src/ipc.c src/executor.c src/posix_osal.c)
+target_include_directories(wlh_host_sim_platform
+    PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/host-core/include)
 target_compile_features(wlh_host_sim_platform PUBLIC c_std_11)
 target_link_libraries(wlh_host_sim_platform PUBLIC Threads::Threads)
 
@@ -37,4 +39,14 @@ if(WLH_SIM_BUILD_TESTING)
         target_compile_options(wlh_host_sim_ipc_tests PRIVATE -Wall -Wextra -Wpedantic -Werror)
     endif()
     add_test(NAME wlh_host_sim_ipc COMMAND wlh_host_sim_ipc_tests)
+
+    add_executable(wlh_posix_osal_tests tests/test_posix_osal.c)
+    target_link_libraries(wlh_posix_osal_tests PRIVATE
+        wlh_host_sim_platform wlh::host_core Threads::Threads)
+    target_compile_features(wlh_posix_osal_tests PRIVATE c_std_11)
+    if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
+        target_compile_options(wlh_posix_osal_tests PRIVATE
+            -Wall -Wextra -Wpedantic -Werror)
+    endif()
+    add_test(NAME wlh_posix_osal COMMAND wlh_posix_osal_tests)
 endif()

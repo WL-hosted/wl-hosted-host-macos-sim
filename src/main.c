@@ -1,4 +1,5 @@
 #include "sim.h"
+#include "posix_osal.h"
 
 #include <signal.h>
 #include <stdatomic.h>
@@ -16,10 +17,11 @@
 typedef struct app {
     sim_ipc_t ipc;
     sim_executor_t executor;
+    sim_executor_t tx_executor;
+    wlh_posix_osal_t osal;
     wlh_host_t host;
 
     pthread_t rx_thread;
-    pthread_mutex_t core_mutex;
     pthread_mutex_t state_mutex;
 
     atomic_bool running;
@@ -33,6 +35,14 @@ typedef struct app {
     uint64_t started_ms;
     uint32_t monitor_interval_ms;
 } app_t;
+
+typedef struct tx_work {
+    app_t *app;
+    uint8_t *frame;
+    size_t size;
+    wlh_transport_tx_complete_fn completion;
+    void *completion_context;
+} tx_work_t;
 
 static atomic_bool interrupted = false;
 
@@ -54,10 +64,31 @@ static int transport_stop(void *context) {
     (void)context;
     return 0;
 }
-static int transport_send(void *context, const uint8_t *frame, size_t size) {
-    return sim_ipc_write(
-        &((app_t *)context)->ipc, SIM_RECORD_WIRE_FRAME, frame, size
+static void tx_work_run(void *context) {
+    tx_work_t *work = context;
+    int status = sim_ipc_write(
+        &work->app->ipc, SIM_RECORD_WIRE_FRAME, work->frame, work->size
     );
+    work->completion(
+        work->completion_context, work->frame, work->size, status
+    );
+    free(work);
+}
+
+static int transport_submit(
+    void *context, uint8_t *frame, size_t size,
+    wlh_transport_tx_complete_fn completion, void *completion_context
+) {
+    app_t *app = context;
+    tx_work_t *work = malloc(sizeof(*work));
+    if (work == NULL)
+        return -1;
+    *work = (tx_work_t){app, frame, size, completion, completion_context};
+    if (sim_executor_post(&app->tx_executor, tx_work_run, work) != 0) {
+        free(work);
+        return -1;
+    }
+    return 0;
 }
 static uint8_t *buffer_alloc(void *context, size_t size) {
     app_t *app = context;
@@ -73,10 +104,6 @@ static uint8_t *buffer_alloc(void *context, size_t size) {
 static void buffer_free(void *context, uint8_t *buffer) {
     (void)context;
     free(buffer);
-}
-static uint64_t host_now(void *context) {
-    (void)context;
-    return monotonic_ms();
 }
 
 static void completion(
@@ -154,7 +181,6 @@ static void send_runtime(app_t *app) {
     if (!app->ipc.sideband)
         return;
 
-    pthread_mutex_lock(&app->core_mutex);
     wlh_host_get_diagnostics(&app->host, &diagnostics);
 
     runtime.role = wlh_sim_v1_SimRole_SIM_ROLE_HOST;
@@ -177,7 +203,6 @@ static void send_runtime(app_t *app) {
     );
     memcpy(runtime.implementation_version, "0.1.0", sizeof("0.1.0"));
 
-    pthread_mutex_unlock(&app->core_mutex);
     (void)send_protobuf(
         app,
         SIM_RECORD_RUNTIME_INFO,
@@ -207,7 +232,6 @@ static void handle_fault(
         return;
     response.request_id = request.request_id;
 
-    pthread_mutex_lock(&app->core_mutex);
     switch (request.fault) {
     case wlh_sim_v1_SimFaultKind_SIM_FAULT_KIND_HOST_RESET:
         wlh_host_transport_lost(&app->host);
@@ -262,7 +286,6 @@ static void handle_fault(
     default:
         break;
     }
-    pthread_mutex_unlock(&app->core_mutex);
 
     (void)send_protobuf(
         app,
@@ -282,9 +305,7 @@ static void *rx_main(void *context) {
         if (sim_ipc_read(&app->ipc, &kind, &payload, &payload_size) != 0)
             break;
         if (kind == SIM_RECORD_WIRE_FRAME) {
-            pthread_mutex_lock(&app->core_mutex);
             (void)wlh_host_on_frame(&app->host, payload, payload_size);
-            pthread_mutex_unlock(&app->core_mutex);
         } else if (kind == SIM_RECORD_FAULT_REQUEST && app->ipc.sideband) {
             handle_fault(app, payload, payload_size);
         }
@@ -302,9 +323,6 @@ static bool wait_until(
     while (atomic_load(&app->running) && !atomic_load(&interrupted) &&
            monotonic_ms() < deadline) {
         bool done;
-        pthread_mutex_lock(&app->core_mutex);
-        (void)wlh_host_poll(&app->host);
-        pthread_mutex_unlock(&app->core_mutex);
         pthread_mutex_lock(&app->state_mutex);
         done = predicate(app);
         pthread_mutex_unlock(&app->state_mutex);
@@ -320,7 +338,9 @@ static bool wait_until(
 }
 
 static bool ready(app_t *app) {
-    return app->host.state == WLH_HOST_STATE_READY;
+    wlh_host_diagnostics_t diagnostics;
+    wlh_host_get_diagnostics(&app->host, &diagnostics);
+    return diagnostics.state == WLH_HOST_STATE_READY;
 }
 static bool one_completion(app_t *app) {
     return app->completions >= 1u;
@@ -352,34 +372,24 @@ static int run_scenario(app_t *app, const char *scenario) {
     if (strcmp(scenario, "smoke") == 0)
         return 0;
 
-    pthread_mutex_lock(&app->core_mutex);
     app->completions = 0u;
     (void)wlh_host_wifi_initialize(&app->host, completion, app);
-    pthread_mutex_unlock(&app->core_mutex);
     if (!wait_until(app, one_completion, 3000u))
         return -1;
 
-    pthread_mutex_lock(&app->core_mutex);
     (void)wlh_host_wifi_scan(&app->host, &scan, completion, app);
-    pthread_mutex_unlock(&app->core_mutex);
     if (!wait_until(app, scan_complete, 3000u))
         return -1;
 
-    pthread_mutex_lock(&app->core_mutex);
     (void)wlh_host_wifi_connect(&app->host, &connect, completion, app);
-    pthread_mutex_unlock(&app->core_mutex);
     if (!wait_until(app, connected, 4000u))
         return -1;
 
-    pthread_mutex_lock(&app->core_mutex);
     (void)wlh_host_ethernet_sta_send(&app->host, ethernet, sizeof(ethernet));
-    pthread_mutex_unlock(&app->core_mutex);
     if (!wait_until(app, ethernet_rx, 3000u))
         return -1;
 
-    pthread_mutex_lock(&app->core_mutex);
     (void)wlh_host_wifi_disconnect(&app->host, completion, app);
-    pthread_mutex_unlock(&app->core_mutex);
     return wait_until(app, disconnected, 3000u) ? 0 : -1;
 }
 
@@ -427,23 +437,23 @@ int main(int argc, char **argv) {
 
     signal(SIGINT, signal_handler);
     signal(SIGTERM, signal_handler);
-    if (pthread_mutex_init(&app.core_mutex, NULL) != 0 ||
-        pthread_mutex_init(&app.state_mutex, NULL) != 0 ||
+    if (pthread_mutex_init(&app.state_mutex, NULL) != 0 ||
         sim_executor_start(&app.executor) != 0 ||
+        sim_executor_start(&app.tx_executor) != 0 ||
         sim_ipc_open(&app.ipc, endpoint) != 0) {
         fprintf(stderr, "host-sim: initialization failed\n");
         return 1;
     }
 
     memset(&config, 0, sizeof(config));
+    wlh_posix_osal_init(&app.osal);
 
     // clang-format off
     config.transport = (wlh_transport_ops_t){
-        &app, transport_start, transport_stop, transport_send};
+        &app, transport_start, transport_stop, transport_submit};
     config.buffers = (wlh_buffer_ops_t){
         &app, buffer_alloc, buffer_free};
-    config.osal = (wlh_osal_ops_t){
-        &app, host_now};
+    config.osal = wlh_posix_osal_ops(&app.osal);
     config.executor = (wlh_executor_ops_t){
         &app.executor, sim_executor_post};
     // clang-format on
@@ -456,6 +466,8 @@ int main(int argc, char **argv) {
     config.heartbeat_interval_ms = 1000u;
     config.heartbeat_timeout_ms = 5000u;
     config.max_pending_rpc = 8u;
+    config.core_queue_depth = 16u;
+    config.stop_timeout_ms = 3000u;
 
     if (wlh_host_init(&app.host, &config) != WLH_HOST_OK)
         return 1;
@@ -464,24 +476,19 @@ int main(int argc, char **argv) {
 
     if (pthread_create(&app.rx_thread, NULL, rx_main, &app) != 0)
         return 1;
-    pthread_mutex_lock(&app.core_mutex);
     result = wlh_host_start(&app.host);
-    pthread_mutex_unlock(&app.core_mutex);
 
     if (result == WLH_HOST_OK)
         result = run_scenario(&app, scenario);
     send_runtime(&app);
 
+    (void)wlh_host_stop(&app.host);
+    sim_executor_stop(&app.tx_executor);
     atomic_store(&app.running, false);
     sim_ipc_close(&app.ipc);
     pthread_join(app.rx_thread, NULL);
-
-    pthread_mutex_lock(&app.core_mutex);
-    (void)wlh_host_stop(&app.host);
-    pthread_mutex_unlock(&app.core_mutex);
     sim_executor_stop(&app.executor);
     pthread_mutex_destroy(&app.state_mutex);
-    pthread_mutex_destroy(&app.core_mutex);
 
     return result == 0 ? 0 : 1;
 }
