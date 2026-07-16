@@ -28,11 +28,20 @@ typedef struct sim_ipc {
 
 int sim_ipc_open(sim_ipc_t *ipc, const char *endpoint);
 void sim_ipc_close(sim_ipc_t *ipc);
-int sim_ipc_write(sim_ipc_t *ipc, uint8_t kind, const uint8_t *payload, size_t payload_size);
-int sim_ipc_read(sim_ipc_t *ipc, uint8_t *kind, uint8_t **payload, size_t *payload_size);
+int sim_ipc_write(
+    sim_ipc_t *ipc, uint8_t kind, const uint8_t *payload, size_t payload_size
+);
+int sim_ipc_read(
+    sim_ipc_t *ipc, uint8_t *kind, uint8_t **payload, size_t *payload_size
+);
 
 typedef void (*sim_task_fn)(void *context);
-typedef struct sim_task { sim_task_fn function; void *context; } sim_task_t;
+
+typedef struct sim_task {
+    sim_task_fn function;
+    void *context;
+} sim_task_t;
+
 typedef struct sim_executor {
     pthread_t thread;
     pthread_mutex_t mutex;

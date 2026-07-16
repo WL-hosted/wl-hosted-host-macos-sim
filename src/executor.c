@@ -2,11 +2,11 @@
 
 #include <string.h>
 
-static void *executor_main(void *context)
-{
+static void *executor_main(void *context) {
     sim_executor_t *executor = context;
     for (;;) {
         sim_task_t task;
+
         pthread_mutex_lock(&executor->mutex);
         while (executor->count == 0u && !executor->stopping)
             pthread_cond_wait(&executor->condition, &executor->mutex);
@@ -14,6 +14,7 @@ static void *executor_main(void *context)
             pthread_mutex_unlock(&executor->mutex);
             break;
         }
+
         task = executor->queue[executor->head];
         executor->head = (executor->head + 1u) % 64u;
         executor->count--;
@@ -23,16 +24,16 @@ static void *executor_main(void *context)
     return NULL;
 }
 
-int sim_executor_start(sim_executor_t *executor)
-{
+int sim_executor_start(sim_executor_t *executor) {
     memset(executor, 0, sizeof(*executor));
-    if (pthread_mutex_init(&executor->mutex, NULL) != 0) return -1;
-    if (pthread_cond_init(&executor->condition, NULL) != 0) return -1;
+    if (pthread_mutex_init(&executor->mutex, NULL) != 0)
+        return -1;
+    if (pthread_cond_init(&executor->condition, NULL) != 0)
+        return -1;
     return pthread_create(&executor->thread, NULL, executor_main, executor);
 }
 
-void sim_executor_stop(sim_executor_t *executor)
-{
+void sim_executor_stop(sim_executor_t *executor) {
     pthread_mutex_lock(&executor->mutex);
     executor->stopping = true;
     pthread_cond_broadcast(&executor->condition);
@@ -42,8 +43,7 @@ void sim_executor_stop(sim_executor_t *executor)
     pthread_mutex_destroy(&executor->mutex);
 }
 
-int sim_executor_post(void *context, sim_task_fn function, void *task_context)
-{
+int sim_executor_post(void *context, sim_task_fn function, void *task_context) {
     sim_executor_t *executor = context;
     size_t tail;
     pthread_mutex_lock(&executor->mutex);
