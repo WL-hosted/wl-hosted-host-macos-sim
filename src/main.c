@@ -1,5 +1,5 @@
-#include "wlh/posix_osal.h"
 #include "sim.h"
+#include "wlh/posix_osal.h"
 
 #include <signal.h>
 #include <stdatomic.h>
@@ -69,7 +69,8 @@ static void lifecycle_work_run(void *context) {
 }
 
 static int submit_lifecycle(
-    app_t *app, wlh_transport_lifecycle_complete_fn completion,
+    app_t *app,
+    wlh_transport_lifecycle_complete_fn completion,
     void *completion_context
 ) {
     lifecycle_work_t *work = malloc(sizeof(*work));
@@ -84,13 +85,15 @@ static int submit_lifecycle(
 }
 
 static int transport_start(
-    void *context, wlh_transport_lifecycle_complete_fn completion,
+    void *context,
+    wlh_transport_lifecycle_complete_fn completion,
     void *completion_context
 ) {
     return submit_lifecycle(context, completion, completion_context);
 }
 static int transport_stop(
-    void *context, wlh_transport_lifecycle_complete_fn completion,
+    void *context,
+    wlh_transport_lifecycle_complete_fn completion,
     void *completion_context
 ) {
     return submit_lifecycle(context, completion, completion_context);
@@ -100,15 +103,16 @@ static void tx_work_run(void *context) {
     int status = sim_ipc_write(
         &work->app->ipc, SIM_RECORD_WIRE_FRAME, work->frame, work->size
     );
-    work->completion(
-        work->completion_context, work->frame, work->size, status
-    );
+    work->completion(work->completion_context, work->frame, work->size, status);
     free(work);
 }
 
 static int transport_submit(
-    void *context, uint8_t *frame, size_t size,
-    wlh_transport_tx_complete_fn completion, void *completion_context
+    void *context,
+    uint8_t *frame,
+    size_t size,
+    wlh_transport_tx_complete_fn completion,
+    void *completion_context
 ) {
     app_t *app = context;
     tx_work_t *work = malloc(sizeof(*work));
@@ -382,9 +386,8 @@ static bool wait_until(
         }
         wake_at = deadline < next_monitor ? deadline : next_monitor;
         now = monotonic_ms();
-        native_duration = relative_duration_ms(
-            wake_at > now ? wake_at - now : 0u
-        );
+        native_duration =
+            relative_duration_ms(wake_at > now ? wake_at - now : 0u);
         (void)pthread_cond_timedwait_relative_np(
             &app->state_changed, &app->state_mutex, &native_duration
         );
