@@ -1,4 +1,5 @@
 #include "sim.h"
+#include "transport_usb.h"
 #include "wlh/posix_osal.h"
 
 #include <signal.h>
@@ -21,6 +22,12 @@ typedef struct app {
     wlh_posix_osal_t osal;
     wlh_host_t host;
 
+    bool use_usb;
+    sim_usb_config_t usb_config;
+    sim_usb_transport_t *usb;
+    const char *ssid;
+    const char *credential;
+
     pthread_t rx_thread;
     pthread_mutex_t state_mutex;
     pthread_cond_t state_changed;
@@ -32,6 +39,9 @@ typedef struct app {
     bool connected;
     bool disconnected;
     bool ethernet_rx;
+    bool device_info_done;
+    wlh_host_result_t device_info_result;
+    bool user_result_received;
 
     uint64_t started_ms;
     uint32_t monitor_interval_ms;
@@ -46,6 +56,8 @@ typedef struct tx_work {
 } tx_work_t;
 
 typedef struct lifecycle_work {
+    app_t *app;
+    bool is_start;
     wlh_transport_lifecycle_complete_fn completion;
     void *completion_context;
 } lifecycle_work_t;
@@ -67,17 +79,34 @@ static void lifecycle_work_run(void *context) {
     work->completion(work->completion_context, 0);
     free(work);
 }
+static void usb_lifecycle_work_run(void *context) {
+    lifecycle_work_t *work = context;
+    int status = 0;
+    if (work->is_start) {
+        status = sim_usb_open(&work->app->usb, &work->app->usb_config);
+    } else {
+        sim_usb_close(work->app->usb);
+        work->app->usb = NULL;
+    }
+    work->completion(work->completion_context, status);
+    free(work);
+}
 
 static int submit_lifecycle(
     app_t *app,
     wlh_transport_lifecycle_complete_fn completion,
-    void *completion_context
+    void *completion_context,
+    bool is_start
 ) {
     lifecycle_work_t *work = malloc(sizeof(*work));
     if (work == NULL)
         return -1;
-    *work = (lifecycle_work_t){completion, completion_context};
-    if (sim_executor_post(&app->tx_executor, lifecycle_work_run, work) != 0) {
+    *work = (lifecycle_work_t){app, is_start, completion, completion_context};
+    if (sim_executor_post(
+            &app->tx_executor,
+            app->use_usb ? usb_lifecycle_work_run : lifecycle_work_run,
+            work
+        ) != 0) {
         free(work);
         return -1;
     }
@@ -89,20 +118,25 @@ static int transport_start(
     wlh_transport_lifecycle_complete_fn completion,
     void *completion_context
 ) {
-    return submit_lifecycle(context, completion, completion_context);
+    return submit_lifecycle(context, completion, completion_context, true);
 }
 static int transport_stop(
     void *context,
     wlh_transport_lifecycle_complete_fn completion,
     void *completion_context
 ) {
-    return submit_lifecycle(context, completion, completion_context);
+    return submit_lifecycle(context, completion, completion_context, false);
 }
 static void tx_work_run(void *context) {
     tx_work_t *work = context;
-    int status = sim_ipc_write(
-        &work->app->ipc, SIM_RECORD_WIRE_FRAME, work->frame, work->size
-    );
+    int status;
+    if (work->app->use_usb) {
+        status = sim_usb_write(work->app->usb, work->frame, work->size);
+    } else {
+        status = sim_ipc_write(
+            &work->app->ipc, SIM_RECORD_WIRE_FRAME, work->frame, work->size
+        );
+    }
     work->completion(work->completion_context, work->frame, work->size, status);
     free(work);
 }
@@ -165,6 +199,52 @@ static void completion(
     );
 }
 
+static void device_info_completion(
+    void *context,
+    wlh_host_result_t result,
+    uint16_t domain,
+    int16_t status,
+    const wlh_host_device_info_t *info
+) {
+    app_t *app = context;
+    fprintf(
+        stderr,
+        "host-sim: device info result=%d domain=%u status=%d\n",
+        result,
+        domain,
+        status
+    );
+    if (result == WLH_HOST_OK && info != NULL) {
+        unsigned index;
+        fprintf(
+            stdout,
+            "host-sim: vendor=%s mcu_model=%s\n",
+            info->vendor,
+            info->mcu_model
+        );
+        fprintf(stdout, "host-sim: board_profile=%s\n", info->board_profile);
+        fprintf(stdout, "host-sim: uid=");
+        for (index = 0; index < info->uid_size; ++index)
+            fprintf(stdout, "%02x", info->uid[index]);
+        fputc('\n', stdout);
+        fflush(stdout);
+    }
+    pthread_mutex_lock(&app->state_mutex);
+    app->device_info_result = result;
+    app->device_info_done = true;
+    pthread_cond_broadcast(&app->state_changed);
+    pthread_mutex_unlock(&app->state_mutex);
+}
+
+static void usb_on_frame(void *context, const uint8_t *frame, size_t size) {
+    app_t *app = context;
+    (void)wlh_host_on_frame(&app->host, frame, size);
+}
+static void usb_on_lost(void *context) {
+    app_t *app = context;
+    wlh_host_transport_lost(&app->host);
+}
+
 static void host_event(void *context, const wlh_host_event_t *event) {
     app_t *app = context;
     pthread_mutex_lock(&app->state_mutex);
@@ -176,6 +256,8 @@ static void host_event(void *context, const wlh_host_event_t *event) {
         app->disconnected = true;
     if (event->kind == WLH_HOST_EVENT_ETHERNET_STA_RX)
         app->ethernet_rx = true;
+    if (event->kind == WLH_HOST_EVENT_USER_MESSAGE_RESULT)
+        app->user_result_received = true;
     pthread_cond_broadcast(&app->state_changed);
     pthread_mutex_unlock(&app->state_mutex);
     fprintf(
@@ -419,15 +501,36 @@ static bool ethernet_rx(app_t *app) {
 static bool disconnected(app_t *app) {
     return app->disconnected;
 }
+static bool device_info_ready(app_t *app) {
+    return app->device_info_done;
+}
+static bool user_result_arrived(app_t *app) {
+    return app->user_result_received;
+}
 
 static int run_scenario(app_t *app, const char *scenario) {
     wlh_wifi_scan_params_t scan = {1u, NULL, 0u, true, 8u};
-    static const uint8_t ssid[] = "WPA2Net";
-    static const uint8_t credential[] = "password123";
-    wlh_wifi_connect_params_t connect = {
-        ssid, sizeof(ssid) - 1u, credential, sizeof(credential) - 1u, 4u, 3000u
-    };
+    static const uint8_t default_ssid[] = "WPA2Net";
+    static const uint8_t default_credential[] = "password123";
+    static const uint8_t user_payload[] = "hello-coproc";
+    const uint8_t *ssid = default_ssid;
+    size_t ssid_size = sizeof(default_ssid) - 1u;
+    const uint8_t *credential = default_credential;
+    size_t credential_size = sizeof(default_credential) - 1u;
+    wlh_wifi_connect_params_t connect;
     uint8_t ethernet[60] = {0x02, 0, 0, 0, 0, 2, 0x02, 0, 0, 0, 0, 1};
+
+    if (app->ssid != NULL) {
+        ssid = (const uint8_t *)app->ssid;
+        ssid_size = strlen(app->ssid);
+    }
+    if (app->credential != NULL) {
+        credential = (const uint8_t *)app->credential;
+        credential_size = strlen(app->credential);
+    }
+    connect = (wlh_wifi_connect_params_t){
+        ssid, ssid_size, credential, credential_size, 4u, 3000u
+    };
 
     if (!wait_until(app, ready, 5000u))
         return -1;
@@ -438,6 +541,29 @@ static int run_scenario(app_t *app, const char *scenario) {
         if (!wait_until(app, not_ready, 2000u))
             return -1;
         return wait_until(app, ready, 5000u) ? 0 : -1;
+    }
+    if (strcmp(scenario, "services") == 0) {
+        (void)wlh_host_get_device_info(&app->host, device_info_completion, app);
+        if (!wait_until(app, device_info_ready, 3000u))
+            return -1;
+        if (app->device_info_result != WLH_HOST_OK)
+            return -1;
+        app->completions = 0u;
+        (void)wlh_host_user_message_send(
+            &app->host,
+            1u,
+            1u,
+            1u /* EXPECT_RESULT */,
+            user_payload,
+            sizeof(user_payload) - 1u,
+            completion,
+            app
+        );
+        if (!wait_until(app, one_completion, 3000u))
+            return -1;
+        /* A RESULT event is optional; give it a short window. */
+        (void)wait_until(app, user_result_arrived, 1500u);
+        return 0;
     }
 
     app->completions = 0u;
@@ -455,9 +581,15 @@ static int run_scenario(app_t *app, const char *scenario) {
     if (!wait_until(app, connected, 4000u))
         return -1;
 
-    (void)wlh_host_ethernet_sta_send(&app->host, ethernet, sizeof(ethernet));
-    if (!wait_until(app, ethernet_rx, 3000u))
-        return -1;
+    /* Ethernet echo is a mock-coprocessor behavior; a real device forwards
+       the frame to the AP instead, so USB mode skips the echo check. */
+    if (!app->use_usb) {
+        (void)wlh_host_ethernet_sta_send(
+            &app->host, ethernet, sizeof(ethernet)
+        );
+        if (!wait_until(app, ethernet_rx, 3000u))
+            return -1;
+    }
 
     (void)wlh_host_wifi_disconnect(&app->host, completion, app);
     return wait_until(app, disconnected, 3000u) ? 0 : -1;
@@ -466,11 +598,30 @@ static int run_scenario(app_t *app, const char *scenario) {
 static void usage(const char *program) {
     fprintf(
         stderr,
-        "usage: %s --ipc connect:PATH|fd:N [--scenario "
-        "smoke|scan|connect|recovery] "
-        "[--monitor-interval-ms N] [--rpc-timeout-ms N]\n",
+        "usage: %s --ipc connect:PATH|fd:N | --usb VID:PID [--scenario "
+        "smoke|scan|connect|recovery|services] "
+        "[--monitor-interval-ms N] [--rpc-timeout-ms N] "
+        "[--ssid SSID] [--credential CREDENTIAL]\n",
         program
     );
+}
+
+static bool parse_usb_ids(
+    const char *text, uint16_t *vendor, uint16_t *product
+) {
+    char *separator;
+    unsigned long vendor_value, product_value;
+    if (text == NULL)
+        return false;
+    vendor_value = strtoul(text, &separator, 16);
+    if (separator == text || *separator != ':' || vendor_value > 0xffffu)
+        return false;
+    product_value = strtoul(separator + 1, NULL, 16);
+    if (product_value > 0xffffu)
+        return false;
+    *vendor = (uint16_t)vendor_value;
+    *product = (uint16_t)product_value;
+    return true;
 }
 
 int main(int argc, char **argv) {
@@ -484,10 +635,34 @@ int main(int argc, char **argv) {
 
     memset(&app, 0, sizeof(app));
     app.monitor_interval_ms = 1000u;
+    app.usb_config = (sim_usb_config_t){0x303au,
+                                        0x8201u,
+                                        0u,
+                                        0x01u,
+                                        0x81u,
+                                        4096u,
+                                        10000u,
+                                        usb_on_frame,
+                                        usb_on_lost,
+                                        &app};
 
     for (index = 1; index < argc; ++index) {
         if (strcmp(argv[index], "--ipc") == 0 && ++index < argc)
             endpoint = argv[index];
+        else if (strcmp(argv[index], "--usb") == 0 && ++index < argc) {
+            app.use_usb = true;
+            if (!parse_usb_ids(
+                    argv[index],
+                    &app.usb_config.vendor_id,
+                    &app.usb_config.product_id
+                )) {
+                usage(argv[0]);
+                return 2;
+            }
+        } else if (strcmp(argv[index], "--ssid") == 0 && ++index < argc)
+            app.ssid = argv[index];
+        else if (strcmp(argv[index], "--credential") == 0 && ++index < argc)
+            app.credential = argv[index];
         else if (strcmp(argv[index], "--scenario") == 0 && ++index < argc)
             scenario = argv[index];
         else if (strcmp(argv[index], "--monitor-interval-ms") == 0 &&
@@ -500,7 +675,7 @@ int main(int argc, char **argv) {
             return 2;
         }
     }
-    if (endpoint == NULL || app.monitor_interval_ms == 0u) {
+    if ((endpoint == NULL) == !app.use_usb || app.monitor_interval_ms == 0u) {
         usage(argv[0]);
         return 2;
     }
@@ -511,7 +686,7 @@ int main(int argc, char **argv) {
         pthread_cond_init(&app.state_changed, NULL) != 0 ||
         sim_executor_start(&app.executor) != 0 ||
         sim_executor_start(&app.tx_executor) != 0 ||
-        sim_ipc_open(&app.ipc, endpoint) != 0) {
+        (!app.use_usb && sim_ipc_open(&app.ipc, endpoint) != 0)) {
         fprintf(stderr, "host-sim: initialization failed\n");
         return 1;
     }
@@ -544,7 +719,8 @@ int main(int argc, char **argv) {
     app.started_ms = monotonic_ms();
     atomic_store(&app.running, true);
 
-    if (pthread_create(&app.rx_thread, NULL, rx_main, &app) != 0)
+    if (!app.use_usb &&
+        pthread_create(&app.rx_thread, NULL, rx_main, &app) != 0)
         return 1;
     result = wlh_host_start(&app.host);
 
@@ -555,8 +731,10 @@ int main(int argc, char **argv) {
     (void)wlh_host_stop(&app.host);
     sim_executor_stop(&app.tx_executor);
     atomic_store(&app.running, false);
-    sim_ipc_close(&app.ipc);
-    pthread_join(app.rx_thread, NULL);
+    if (!app.use_usb) {
+        sim_ipc_close(&app.ipc);
+        pthread_join(app.rx_thread, NULL);
+    }
     sim_executor_stop(&app.executor);
     pthread_cond_destroy(&app.state_changed);
     pthread_mutex_destroy(&app.state_mutex);

@@ -23,3 +23,25 @@ ctest --test-dir build --output-on-failure
 
 The executable role is fixed to `HOST_SIM`; direct Host/Coproc connections
 automatically disable sideband traffic.
+
+## Real USB Coprocessor transport
+
+Besides the virtual IPC transport, the simulator can attach to a real USB
+Coprocessor (profile `espressif.esp32s3.coreboard.usb-wifi`) over a
+vendor-specific bulk interface. USB mode speaks raw WL-hosted frames without
+the simulator IPC record layer and disables sideband reporting. It requires
+libusb-1.0 (`brew install libusb` on macOS).
+
+```sh
+./build/wlh-host-macos-sim --usb 303A:8201 --scenario connect \
+    --ssid MyAp --credential MyPassphrase
+```
+
+- Bulk OUT carries Host to Coprocessor frames, bulk IN the reverse; frame
+  boundaries follow the 24-byte wire header, not USB packet boundaries.
+- A bus disconnect raises `wlh_host_transport_lost`; the Core then restarts
+  the transport (stop, bounded reopen wait, start) and renegotiates Hello.
+- The Ethernet echo step is skipped in USB mode because a real device
+  forwards frames to the AP instead of echoing them.
+- `--scenario services` exercises the Device Information and User
+  Passthrough services against the real firmware.

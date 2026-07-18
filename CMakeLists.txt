@@ -3,6 +3,8 @@ project(wlh_host_macos_sim VERSION 0.1.0 LANGUAGES C)
 
 include(CTest)
 find_package(Threads REQUIRED)
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(LIBUSB REQUIRED IMPORTED_TARGET libusb-1.0)
 
 set(WLH_SIM_BUILD_TESTING ${BUILD_TESTING})
 set(BUILD_TESTING OFF)
@@ -12,11 +14,13 @@ wlh_common_enable_posix_osal(BUILD_TESTING "${WLH_SIM_BUILD_TESTING}")
 
 target_compile_definitions(wlh_host_core PRIVATE WLH_ENABLE_TEST_HOOKS)
 
-add_library(wlh_host_sim_platform STATIC src/ipc.c src/executor.c)
+add_library(wlh_host_sim_platform STATIC
+    src/ipc.c src/executor.c src/transport_usb.c)
 target_include_directories(wlh_host_sim_platform
     PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_compile_features(wlh_host_sim_platform PUBLIC c_std_11)
-target_link_libraries(wlh_host_sim_platform PUBLIC Threads::Threads)
+target_link_libraries(wlh_host_sim_platform
+    PUBLIC Threads::Threads PkgConfig::LIBUSB)
 
 add_executable(wlh-host-macos-sim src/main.c)
 target_compile_features(wlh-host-macos-sim PRIVATE c_std_11)
