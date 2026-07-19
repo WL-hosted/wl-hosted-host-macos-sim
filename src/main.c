@@ -415,6 +415,120 @@ static void handle_fault(
     );
 }
 
+static void handle_wifi_command(
+    app_t *app, const uint8_t *payload, size_t payload_size
+) {
+    wlh_sim_v1_SimWifiCommand message = wlh_sim_v1_SimWifiCommand_init_zero;
+    pb_istream_t stream = pb_istream_from_buffer(payload, payload_size);
+    const char *kind = NULL;
+    wlh_host_result_t result = WLH_HOST_OK;
+
+    if (!pb_decode(&stream, wlh_sim_v1_SimWifiCommand_fields, &message) ||
+        message.command_id == 0u || message.which_command == 0u) {
+        fprintf(stderr, "host-sim: wifi command ignored (invalid record)\n");
+        return;
+    }
+
+    switch (message.which_command) {
+    case wlh_sim_v1_SimWifiCommand_scan_tag: {
+        size_t ssid_size = strnlen(
+            message.command.scan.ssid, sizeof(message.command.scan.ssid)
+        );
+        wlh_wifi_scan_params_t params = {
+            message.command.scan.scan_id,
+            ssid_size == 0u ? NULL : (const uint8_t *)message.command.scan.ssid,
+            ssid_size,
+            message.command.scan.include_hidden,
+            message.command.scan.max_results == 0u
+                ? 8u
+                : message.command.scan.max_results
+        };
+        kind = "scan";
+        result = wlh_host_wifi_scan(&app->host, &params, completion, app);
+        break;
+    }
+
+    case wlh_sim_v1_SimWifiCommand_connect_tag: {
+        wlh_wifi_connect_params_t params = {
+            (const uint8_t *)message.command.connect.ssid,
+            strnlen(
+                message.command.connect.ssid,
+                sizeof(message.command.connect.ssid)
+            ),
+            (const uint8_t *)message.command.connect.credential,
+            strnlen(
+                message.command.connect.credential,
+                sizeof(message.command.connect.credential)
+            ),
+            message.command.connect.security == 0u
+                ? 4u
+                : message.command.connect.security,
+            message.command.connect.timeout_ms == 0u
+                ? 3000u
+                : message.command.connect.timeout_ms
+        };
+        kind = "connect";
+        result = wlh_host_wifi_connect(&app->host, &params, completion, app);
+        break;
+    }
+
+    case wlh_sim_v1_SimWifiCommand_disconnect_tag:
+        kind = "disconnect";
+        result = wlh_host_wifi_disconnect(&app->host, completion, app);
+        break;
+
+    case wlh_sim_v1_SimWifiCommand_start_ap_tag: {
+        size_t credential_size = strnlen(
+            message.command.start_ap.credential,
+            sizeof(message.command.start_ap.credential)
+        );
+        wlh_wifi_start_ap_params_t params = {
+            (const uint8_t *)message.command.start_ap.ssid,
+            strnlen(
+                message.command.start_ap.ssid,
+                sizeof(message.command.start_ap.ssid)
+            ),
+            (const uint8_t *)message.command.start_ap.credential,
+            credential_size,
+            message.command.start_ap.security == 0u
+                ? (credential_size == 0u ? 1u : 4u)
+                : message.command.start_ap.security,
+            message.command.start_ap.channel,
+            message.command.start_ap.max_clients
+        };
+        kind = "start_ap";
+        result = wlh_host_wifi_start_ap(&app->host, &params, completion, app);
+        break;
+    }
+
+    case wlh_sim_v1_SimWifiCommand_stop_ap_tag:
+        kind = "stop_ap";
+        result = wlh_host_wifi_stop_ap(&app->host, completion, app);
+        break;
+
+    default:
+        fprintf(
+            stderr,
+            "host-sim: wifi command id=%u unknown kind=%u\n",
+            message.command_id,
+            (unsigned)message.which_command
+        );
+        return;
+    }
+
+    fprintf(
+        stderr, "host-sim: wifi command %s id=%u\n", kind, message.command_id
+    );
+    if (result != WLH_HOST_OK)
+        fprintf(
+            stderr,
+            "host-sim: wifi command %s id=%u rejected result=%d\n",
+            kind,
+            message.command_id,
+            result
+        );
+}
+
 static void *rx_main(void *context) {
     app_t *app = context;
     while (atomic_load(&app->running)) {
@@ -427,6 +541,8 @@ static void *rx_main(void *context) {
             (void)wlh_host_on_frame(&app->host, payload, payload_size);
         } else if (kind == SIM_RECORD_FAULT_REQUEST && app->ipc.sideband) {
             handle_fault(app, payload, payload_size);
+        } else if (kind == SIM_RECORD_WIFI_COMMAND && app->ipc.sideband) {
+            handle_wifi_command(app, payload, payload_size);
         }
         free(payload);
     }
@@ -508,6 +624,20 @@ static bool user_result_arrived(app_t *app) {
     return app->user_result_received;
 }
 
+static int run_managed(app_t *app) {
+    while (atomic_load(&app->running) && !atomic_load(&interrupted)) {
+        if (!wait_until(app, ready, 30000u))
+            break;
+        app->completions = 0u;
+        (void)wlh_host_wifi_initialize(&app->host, completion, app);
+        /* Repeat INITIALIZE is idempotent; tolerate a missing completion. */
+        if (!wait_until(app, one_completion, 3000u))
+            fprintf(stderr, "host-sim: managed initialize not confirmed\n");
+        (void)wait_until(app, not_ready, UINT32_MAX);
+    }
+    return atomic_load(&app->running) && !atomic_load(&interrupted) ? -1 : 0;
+}
+
 static int run_scenario(app_t *app, const char *scenario) {
     wlh_wifi_scan_params_t scan = {1u, NULL, 0u, true, 8u};
     static const uint8_t default_ssid[] = "WPA2Net";
@@ -536,6 +666,8 @@ static int run_scenario(app_t *app, const char *scenario) {
         return -1;
     if (strcmp(scenario, "smoke") == 0)
         return 0;
+    if (strcmp(scenario, "managed") == 0)
+        return run_managed(app);
     if (strcmp(scenario, "recovery") == 0) {
         wlh_host_transport_lost(&app->host);
         if (!wait_until(app, not_ready, 2000u))
@@ -599,7 +731,7 @@ static void usage(const char *program) {
     fprintf(
         stderr,
         "usage: %s --ipc connect:PATH|fd:N | --usb VID:PID [--scenario "
-        "smoke|scan|connect|recovery|services] "
+        "smoke|scan|connect|recovery|services|managed] "
         "[--monitor-interval-ms N] [--rpc-timeout-ms N] "
         "[--ssid SSID] [--credential CREDENTIAL]\n",
         program
@@ -682,6 +814,9 @@ int main(int argc, char **argv) {
 
     signal(SIGINT, signal_handler);
     signal(SIGTERM, signal_handler);
+    /* Managed sessions are long-lived: a Manager disconnect must surface as
+     * EPIPE from write(), never as a fatal SIGPIPE. */
+    signal(SIGPIPE, SIG_IGN);
     if (pthread_mutex_init(&app.state_mutex, NULL) != 0 ||
         pthread_cond_init(&app.state_changed, NULL) != 0 ||
         sim_executor_start(&app.executor) != 0 ||

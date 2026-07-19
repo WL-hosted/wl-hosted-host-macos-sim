@@ -15,7 +15,8 @@ enum sim_record_kind {
     SIM_RECORD_WIRE_FRAME = 1,
     SIM_RECORD_RUNTIME_INFO = 2,
     SIM_RECORD_FAULT_REQUEST = 3,
-    SIM_RECORD_FAULT_RESPONSE = 4
+    SIM_RECORD_FAULT_RESPONSE = 4,
+    SIM_RECORD_WIFI_COMMAND = 5
 };
 
 typedef struct sim_ipc {

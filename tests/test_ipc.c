@@ -1,6 +1,7 @@
 #include "sim.h"
 
 #include <assert.h>
+#include <fcntl.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -74,7 +75,13 @@ int main(void) {
 
     assert(socketpair(AF_UNIX, SOCK_STREAM, 0, pair) == 0);
     assert(pthread_create(&peer, NULL, peer_main, &pair[1]) == 0);
-    assert(sim_ipc_open(&ipc, "fd:0") != 0);
+    {
+        char endpoint[32];
+        int null_fd = open("/dev/null", O_RDWR);
+        assert(null_fd >= 0);
+        snprintf(endpoint, sizeof(endpoint), "fd:%d", null_fd);
+        assert(sim_ipc_open(&ipc, endpoint) != 0);
+    }
     {
         char endpoint[32];
         snprintf(endpoint, sizeof(endpoint), "fd:%d", pair[0]);

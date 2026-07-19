@@ -103,8 +103,8 @@ ctest --test-dir build-asan --output-on-failure
 --usb VID:PID
     指定 USB 后端 VID:PID（十六进制）。与 --ipc 二选一。
 
---scenario smoke|scan|connect|recovery|services
-    指定运行场景，默认 connect。
+--scenario smoke|scan|connect|recovery|services|managed
+    指定运行场景，默认 connect。managed 仅适用于 IPC 模式。
 
 --monitor-interval-ms N
     设置 sideband 运行时信息上报间隔，单位毫秒，默认 1000。
@@ -130,6 +130,7 @@ ctest --test-dir build-asan --output-on-failure
 | `scan` | 初始化 Wi-Fi，执行一次 BSS 扫描，等待 `WLH_HOST_EVENT_WIFI_SCAN_COMPLETED` 事件。 |
 | `connect` | 在 `scan` 的基础上，使用 `--ssid`/`--credential` 连接指定 AP，等待 `WLH_HOST_EVENT_WIFI_CONNECTED`，发送 Ethernet echo 帧并等待 `WLH_HOST_EVENT_ETHERNET_STA_RX`，最后断开并等待 `WLH_HOST_EVENT_WIFI_DISCONNECTED`。 |
 | `services` | 调用 Device Information 服务获取厂商/板级/UID 信息，并发送一条 User Passthrough 消息等待 completion；还会短暂等待可选的 `USER_MESSAGE_RESULT` 事件。 |
+| `managed` | Manager 驱动模式：等待 READY 后自动执行一次 Wi-Fi INITIALIZE（对端已初始化时容忍失败），随后长期驻留，通过 sideband 接收 Manager 下发的 `SIM_RECORD_WIFI_COMMAND`（scan / connect / disconnect / start_ap / stop_ap）并转换为标准 Wi-Fi RPC；链路断开后自动重新等待 READY 并重新 INITIALIZE，直到收到退出信号。仅 IPC + sideband 模式有效；USB `--usb` 独立运行模式行为不变。 |
 
 ## 7. 架构与线程模型
 
