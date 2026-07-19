@@ -662,12 +662,14 @@ static int run_scenario(app_t *app, const char *scenario) {
         ssid, ssid_size, credential, credential_size, 4u, 3000u
     };
 
+    /* Managed mode owns its (longer) READY wait; skip the scenario gate. */
+    if (strcmp(scenario, "managed") == 0)
+        return run_managed(app);
+
     if (!wait_until(app, ready, 5000u))
         return -1;
     if (strcmp(scenario, "smoke") == 0)
         return 0;
-    if (strcmp(scenario, "managed") == 0)
-        return run_managed(app);
     if (strcmp(scenario, "recovery") == 0) {
         wlh_host_transport_lost(&app->host);
         if (!wait_until(app, not_ready, 2000u))
