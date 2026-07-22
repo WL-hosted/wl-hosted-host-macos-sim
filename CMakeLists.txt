@@ -47,7 +47,7 @@ target_compile_features(wlh-host-macos-sim PRIVATE c_std_11)
 target_compile_definitions(wlh-host-macos-sim PRIVATE WLH_ENABLE_TEST_HOOKS)
 target_link_libraries(wlh-host-macos-sim PRIVATE
     wlh_host_sim_platform wlh::host_core wlh::posix_osal wlh::log
-    wlh::easylogger wlh_sim_nanopb Threads::Threads)
+    wlh_sim_nanopb Threads::Threads)
 
 foreach(target wlh_host_sim_platform wlh-host-macos-sim)
     set_target_properties(${target} PROPERTIES C_EXTENSIONS OFF)

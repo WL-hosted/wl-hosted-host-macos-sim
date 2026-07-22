@@ -79,7 +79,9 @@ static int connect_unix(const char *path) {
     address.sun_family = AF_UNIX;
     memcpy(address.sun_path, path, strlen(path) + 1u);
     if (connect(fd, (const struct sockaddr *)&address, sizeof(address)) != 0) {
-        WLH_LOGW("host-sim", "unix connect to %s failed: %s", path, strerror(errno));
+        WLH_LOGW(
+            "host-sim", "unix connect to %s failed: %s", path, strerror(errno)
+        );
         close(fd);
         return -1;
     }

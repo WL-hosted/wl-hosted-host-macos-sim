@@ -217,7 +217,9 @@ static void device_info_completion(
     );
     if (result == WLH_HOST_OK && info != NULL) {
         unsigned index;
-        WLH_LOGI("host-sim", "vendor=%s mcu_model=%s", info->vendor, info->mcu_model);
+        WLH_LOGI(
+            "host-sim", "vendor=%s mcu_model=%s", info->vendor, info->mcu_model
+        );
         WLH_LOGI("host-sim", "board_profile=%s", info->board_profile);
         fprintf(stdout, "host-sim: uid=");
         for (index = 0; index < info->uid_size; ++index)

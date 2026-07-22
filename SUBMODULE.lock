@@ -1,4 +1,4 @@
 core.url=https://github.com/WL-hosted/wl-hosted-core.git
-core.commit=a063b66aa14b2048717e5e267e0582646f190248
+core.commit=7238ca95e3f82da9a151e1624a7dc9f71aca0a3a
 easylogger.url=https://github.com/armink/EasyLogger.git
 easylogger.commit=a596b2642e27af3a2dbdeb0e5f04a6b5b673ef24
