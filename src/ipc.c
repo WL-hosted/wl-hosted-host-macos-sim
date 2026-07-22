@@ -1,4 +1,5 @@
 #include "sim.h"
+#include "wlh/log.h"
 
 #include <errno.h>
 #include <stdlib.h>
@@ -53,6 +54,19 @@ static int read_all(int fd, uint8_t *data, size_t size) {
     return 0;
 }
 
+static const char *role_name(enum sim_role role) {
+    switch (role) {
+    case SIM_ROLE_HOST:
+        return "host";
+    case SIM_ROLE_COPROC:
+        return "coproc";
+    case SIM_ROLE_MANAGER:
+        return "manager";
+    default:
+        return "unknown";
+    }
+}
+
 static int connect_unix(const char *path) {
     int fd;
     struct sockaddr_un address;
@@ -65,6 +79,7 @@ static int connect_unix(const char *path) {
     address.sun_family = AF_UNIX;
     memcpy(address.sun_path, path, strlen(path) + 1u);
     if (connect(fd, (const struct sockaddr *)&address, sizeof(address)) != 0) {
+        WLH_LOGW("host-sim", "unix connect to %s failed: %s", path, strerror(errno));
         close(fd);
         return -1;
     }
@@ -92,8 +107,10 @@ int sim_ipc_open(sim_ipc_t *ipc, const char *endpoint) {
             return -1;
         ipc->fd = (int)inherited;
     }
-    if (ipc->fd < 0)
+    if (ipc->fd < 0) {
+        WLH_LOGW("host-sim", "IPC endpoint %s open failed", endpoint);
         return -1;
+    }
 
     memcpy(local, hello_magic, sizeof(hello_magic));
     write16(local + 8u, 1u);
@@ -110,6 +127,7 @@ int sim_ipc_open(sim_ipc_t *ipc, const char *endpoint) {
         (peer[11] & (uint8_t)~SIM_IPC_SIDEBAND_FLAG) != 0u ||
         read32(peer + 12u) < 4u) {
         // clang-format on
+        WLH_LOGW("host-sim", "IPC hello negotiation failed");
         sim_ipc_close(ipc);
         return -1;
     }
@@ -120,6 +138,13 @@ int sim_ipc_open(sim_ipc_t *ipc, const char *endpoint) {
                                : SIM_IPC_MAX_RECORD_SIZE;
     ipc->sideband = ipc->peer_role == SIM_ROLE_MANAGER &&
                     (peer[11] & SIM_IPC_SIDEBAND_FLAG) != 0u;
+    WLH_LOGI(
+        "host-sim",
+        "IPC hello ok peer=%s max_record=%u sideband=%d",
+        role_name(ipc->peer_role),
+        ipc->max_record_size,
+        ipc->sideband
+    );
 
     if (pthread_mutex_init(&ipc->write_mutex, NULL) != 0) {
         sim_ipc_close(ipc);
@@ -132,6 +157,7 @@ void sim_ipc_close(sim_ipc_t *ipc) {
     if (ipc == NULL)
         return;
     if (ipc->fd >= 0) {
+        WLH_LOGI("host-sim", "IPC closing fd=%d", ipc->fd);
         shutdown(ipc->fd, SHUT_RDWR);
         close(ipc->fd);
         ipc->fd = -1;

@@ -1,5 +1,6 @@
 #include "sim.h"
 #include "transport_usb.h"
+#include "wlh/log.h"
 #include "wlh/posix_osal.h"
 
 #include <signal.h>
@@ -190,9 +191,9 @@ static void completion(
     app->completions++;
     pthread_cond_broadcast(&app->state_changed);
     pthread_mutex_unlock(&app->state_mutex);
-    fprintf(
-        stderr,
-        "host-sim: RPC completion result=%d domain=%u status=%d\n",
+    WLH_LOGI(
+        "host-sim",
+        "RPC completion result=%d domain=%u status=%d",
         result,
         domain,
         status
@@ -207,22 +208,17 @@ static void device_info_completion(
     const wlh_host_device_info_t *info
 ) {
     app_t *app = context;
-    fprintf(
-        stderr,
-        "host-sim: device info result=%d domain=%u status=%d\n",
+    WLH_LOGI(
+        "host-sim",
+        "device info result=%d domain=%u status=%d",
         result,
         domain,
         status
     );
     if (result == WLH_HOST_OK && info != NULL) {
         unsigned index;
-        fprintf(
-            stdout,
-            "host-sim: vendor=%s mcu_model=%s\n",
-            info->vendor,
-            info->mcu_model
-        );
-        fprintf(stdout, "host-sim: board_profile=%s\n", info->board_profile);
+        WLH_LOGI("host-sim", "vendor=%s mcu_model=%s", info->vendor, info->mcu_model);
+        WLH_LOGI("host-sim", "board_profile=%s", info->board_profile);
         fprintf(stdout, "host-sim: uid=");
         for (index = 0; index < info->uid_size; ++index)
             fprintf(stdout, "%02x", info->uid[index]);
@@ -260,9 +256,9 @@ static void host_event(void *context, const wlh_host_event_t *event) {
         app->user_result_received = true;
     pthread_cond_broadcast(&app->state_changed);
     pthread_mutex_unlock(&app->state_mutex);
-    fprintf(
-        stderr,
-        "host-sim: event=%d state=%d service=%u method=%u bytes=%zu\n",
+    WLH_LOGI(
+        "host-sim",
+        "event kind=%d state=%d service=%u method=%u bytes=%zu",
         event->kind,
         event->state,
         event->service_id,
@@ -425,7 +421,7 @@ static void handle_wifi_command(
 
     if (!pb_decode(&stream, wlh_sim_v1_SimWifiCommand_fields, &message) ||
         message.command_id == 0u || message.which_command == 0u) {
-        fprintf(stderr, "host-sim: wifi command ignored (invalid record)\n");
+        WLH_LOGW("host-sim", "wifi command ignored (invalid record)");
         return;
     }
 
@@ -516,13 +512,11 @@ static void handle_wifi_command(
         return;
     }
 
-    fprintf(
-        stderr, "host-sim: wifi command %s id=%u\n", kind, message.command_id
-    );
+    WLH_LOGI("host-sim", "wifi command %s id=%u", kind, message.command_id);
     if (result != WLH_HOST_OK)
-        fprintf(
-            stderr,
-            "host-sim: wifi command %s id=%u rejected result=%d\n",
+        WLH_LOGW(
+            "host-sim",
+            "wifi command %s id=%u rejected result=%d",
             kind,
             message.command_id,
             result
@@ -632,7 +626,7 @@ static int run_managed(app_t *app) {
         (void)wlh_host_wifi_initialize(&app->host, completion, app);
         /* Repeat INITIALIZE is idempotent; tolerate a missing completion. */
         if (!wait_until(app, one_completion, 3000u))
-            fprintf(stderr, "host-sim: managed initialize not confirmed\n");
+            WLH_LOGW("host-sim", "managed initialize not confirmed");
         (void)wait_until(app, not_ready, UINT32_MAX);
     }
     return atomic_load(&app->running) && !atomic_load(&interrupted) ? -1 : 0;
@@ -819,12 +813,23 @@ int main(int argc, char **argv) {
     /* Managed sessions are long-lived: a Manager disconnect must surface as
      * EPIPE from write(), never as a fatal SIGPIPE. */
     signal(SIGPIPE, SIG_IGN);
+
+    WLH_LOG_INIT();
+    WLH_LOGI(
+        "host-sim",
+        "starting scenario=%s endpoint=%s usb=%s rpc_timeout_ms=%u",
+        scenario,
+        app.use_usb ? "usb" : endpoint,
+        app.use_usb ? "yes" : "no",
+        rpc_timeout_ms
+    );
+
     if (pthread_mutex_init(&app.state_mutex, NULL) != 0 ||
         pthread_cond_init(&app.state_changed, NULL) != 0 ||
         sim_executor_start(&app.executor) != 0 ||
         sim_executor_start(&app.tx_executor) != 0 ||
         (!app.use_usb && sim_ipc_open(&app.ipc, endpoint) != 0)) {
-        fprintf(stderr, "host-sim: initialization failed\n");
+        WLH_LOGE("host-sim", "initialization failed");
         return 1;
     }
 

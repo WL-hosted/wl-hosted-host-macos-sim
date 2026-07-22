@@ -1,4 +1,5 @@
 #include "transport_usb.h"
+#include "wlh/log.h"
 
 #include <pthread.h>
 #include <stdatomic.h>
@@ -108,9 +109,9 @@ static void *rx_main(void *argument) {
         if (status == LIBUSB_ERROR_TIMEOUT)
             continue;
         if (status != 0) {
-            fprintf(
-                stderr,
-                "host-sim: usb bulk read failed: %s\n",
+            WLH_LOGE(
+                "host-sim",
+                "usb bulk read failed: %s",
                 libusb_error_name(status)
             );
             if (atomic_load(&transport->running) &&
@@ -184,9 +185,9 @@ int sim_usb_open(
         }
     }
     if (created->handle == NULL) {
-        fprintf(
-            stderr,
-            "host-sim: usb device %04x:%04x not found\n",
+        WLH_LOGW(
+            "host-sim",
+            "usb device %04x:%04x not found",
             config->vendor_id,
             config->product_id
         );
@@ -204,7 +205,7 @@ int sim_usb_open(
     }
     if (libusb_claim_interface(created->handle, config->interface_number) !=
         0) {
-        fprintf(stderr, "host-sim: usb claim interface failed\n");
+        WLH_LOGE("host-sim", "usb claim interface failed");
         libusb_close(created->handle);
         libusb_exit(created->context);
         free(created);
@@ -222,6 +223,13 @@ int sim_usb_open(
         return -1;
     }
 
+    WLH_LOGI(
+        "host-sim",
+        "usb opened %04x:%04x interface=%u",
+        config->vendor_id,
+        config->product_id,
+        config->interface_number
+    );
     *transport = created;
     return 0;
 }
@@ -229,6 +237,7 @@ int sim_usb_open(
 void sim_usb_close(sim_usb_transport_t *transport) {
     if (transport == NULL)
         return;
+    WLH_LOGI("host-sim", "usb closing");
     atomic_store(&transport->running, false);
     pthread_join(transport->rx_thread, NULL);
     if (transport->handle != NULL) {
@@ -258,9 +267,9 @@ int sim_usb_write(
             USB_TX_TIMEOUT_MS
         );
         if (status != 0) {
-            fprintf(
-                stderr,
-                "host-sim: usb bulk write failed: %s\n",
+            WLH_LOGE(
+                "host-sim",
+                "usb bulk write failed: %s",
                 libusb_error_name(status)
             );
             return -1;

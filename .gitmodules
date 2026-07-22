@@ -1,3 +1,6 @@
 [submodule "core"]
 	path = core
 	url = https://github.com/WL-hosted/wl-hosted-core.git
+[submodule "third_party/easylogger"]
+	path = third_party/easylogger
+	url = https://github.com/armink/EasyLogger.git
