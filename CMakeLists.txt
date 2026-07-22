@@ -8,7 +8,7 @@ pkg_check_modules(LIBUSB REQUIRED IMPORTED_TARGET libusb-1.0)
 
 set(WLH_SIM_BUILD_TESTING ${BUILD_TESTING})
 set(BUILD_TESTING OFF)
-add_subdirectory(host-core host-core-build EXCLUDE_FROM_ALL)
+add_subdirectory(core/host-core core-host-build EXCLUDE_FROM_ALL)
 set(BUILD_TESTING ${WLH_SIM_BUILD_TESTING})
 wlh_common_enable_posix_osal(BUILD_TESTING "${WLH_SIM_BUILD_TESTING}")
 

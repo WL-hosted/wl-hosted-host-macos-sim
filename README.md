@@ -2,20 +2,21 @@
 
 `wl-hosted-host-macos-sim` 是 WL-hosted 协议栈在 macOS 上的 Host 端模拟器。它基于 POSIX 线程、条件变量和单调时钟，把平台相关的部分适配到 WL-hosted Host Core，并提供场景化（scenario）运行器，用于在桌面端验证 Host Core 的链路建立、Wi-Fi 扫描、连接、Ethernet 透传、服务调用以及故障恢复等行为。
 
-本仓库仅包含 macOS/POSIX 适配层与可执行程序，平台无关的核心逻辑位于嵌套的 `host-core` 子模块中。
+本仓库仅包含 macOS/POSIX 适配层与可执行程序，平台无关的核心逻辑位于 `core/host-core`；`core/` 是 `wl-hosted-core` 单一子模块。
 
 ## 1. 仓库定位
 
 在 WL-hosted 多仓库工作区中，各仓库的职责边界如下：
 
 ```text
-wl-hosted-host-macos-sim -> wl-hosted-host-core -> wl-hosted-protocol
-                                                  -> wl-hosted-common
+wl-hosted-host-macos-sim -> wl-hosted-core/host-core
+                           -> wl-hosted-core/protocol
+                           -> wl-hosted-core/common
 ```
 
-- `wl-hosted-host-core`：平台无关的 Host Core，包含状态机、RPC 超时、credit 管理、Hello 协商等。
-- `wl-hosted-protocol`：标准 Wire/RPC codec、protobuf/nanopb schema、Simulator IPC sideband schema。
-- `wl-hosted-common`：共享平台契约，OSAL 唯一来源位于 `osal/include/wlh/osal.h`；`wlh_posix_osal` 由 Common 提供，供本仓库启用。
+- `core/host-core`：平台无关的 Host Core，包含状态机、RPC 超时、credit 管理、Hello 协商等。
+- `core/protocol`：标准 Wire/RPC codec、protobuf/nanopb schema、Simulator IPC sideband schema。
+- `core/common`：共享平台契约，OSAL 唯一来源位于 `osal/include/wlh/osal.h`；`wlh_posix_osal` 由 Common 提供，供本仓库启用。
 
 本仓库的角色固定为 `HOST_SIM`。当通过 `--ipc` 直接连接对端（Manager 或 Coproc Sim）时，会自动启用 sideband 运行时/故障注入通道；当通过 `--usb` 连接真实 Coprocessor 时，只传输标准 WL-hosted wire 帧，sideband 关闭。
 
@@ -204,16 +205,15 @@ ctest --test-dir build-debug --output-on-failure
 
 本目录是独立 Git 仓库。修改后应单独提交，不要在工作区根目录执行全局 `git` 操作。
 
-本仓库依赖的 `host-core` 子模块信息记录在：
+本仓库依赖的 `core` 子模块信息记录在：
 
 - `.gitmodules`
-- `host-core/` gitlink
+- `core/` gitlink
 - `SUBMODULE.lock`
 
 更新子模块后应同步 `SUBMODULE.lock` 中的 commit，并确保：
 
-- `host-core.commit` 与 gitlink 一致。
-- `protocol.transitive.commit` 和 `common.transitive.commit` 反映 host-core 嵌套依赖的实际 commit。
+- `core.commit` 与 gitlink 一致。
 
 完成后执行：
 
