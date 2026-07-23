@@ -15,6 +15,7 @@
 #include "wlh/host.h"
 #include <pb_decode.h>
 #include <pb_encode.h>
+#include <wifi.pb.h>
 
 typedef struct app {
     sim_ipc_t ipc;
@@ -243,6 +244,81 @@ static void usb_on_lost(void *context) {
     wlh_host_transport_lost(&app->host);
 }
 
+static const char *wifi_security_name(wlh_protocol_v1_WifiSecurity security) {
+    switch (security) {
+    case wlh_protocol_v1_WifiSecurity_WIFI_SECURITY_OPEN:
+        return "Open";
+    case wlh_protocol_v1_WifiSecurity_WIFI_SECURITY_WEP:
+        return "WEP";
+    case wlh_protocol_v1_WifiSecurity_WIFI_SECURITY_WPA_PSK:
+        return "WPA-PSK";
+    case wlh_protocol_v1_WifiSecurity_WIFI_SECURITY_WPA2_PSK:
+        return "WPA2-PSK";
+    case wlh_protocol_v1_WifiSecurity_WIFI_SECURITY_WPA_WPA2_PSK:
+        return "WPA/WPA2-PSK";
+    case wlh_protocol_v1_WifiSecurity_WIFI_SECURITY_WPA3_SAE:
+        return "WPA3-SAE";
+    case wlh_protocol_v1_WifiSecurity_WIFI_SECURITY_WPA2_WPA3_PSK:
+        return "WPA2/WPA3-PSK";
+    case wlh_protocol_v1_WifiSecurity_WIFI_SECURITY_OWE:
+        return "OWE";
+    case wlh_protocol_v1_WifiSecurity_WIFI_SECURITY_WPA2_ENTERPRISE:
+        return "WPA2-Enterprise";
+    case wlh_protocol_v1_WifiSecurity_WIFI_SECURITY_WPA3_ENTERPRISE:
+        return "WPA3-Enterprise";
+    case wlh_protocol_v1_WifiSecurity_WIFI_SECURITY_UNSPECIFIED:
+    default:
+        return "Unknown";
+    }
+}
+
+static void log_scan_results(const wlh_host_event_t *event) {
+    wlh_protocol_v1_WifiScanResultEvent result =
+        wlh_protocol_v1_WifiScanResultEvent_init_zero;
+    pb_istream_t input =
+        pb_istream_from_buffer(event->payload, event->payload_size);
+    pb_size_t index;
+
+    if (!pb_decode(
+            &input, wlh_protocol_v1_WifiScanResultEvent_fields, &result
+        )) {
+        WLH_LOGW("host-sim", "failed to decode Wi-Fi scan result event");
+        return;
+    }
+    for (index = 0; index < result.networks_count; ++index) {
+        const wlh_protocol_v1_WifiNetwork *network = &result.networks[index];
+        char ssid[sizeof(network->ssid.bytes) + 1u];
+        pb_size_t ssid_index;
+        for (ssid_index = 0; ssid_index < network->ssid.size; ++ssid_index) {
+            uint8_t byte = network->ssid.bytes[ssid_index];
+            ssid[ssid_index] =
+                (byte >= 0x20u && byte <= 0x7eu) ? (char)byte : '.';
+        }
+        ssid[network->ssid.size] = '\0';
+        if (network->bssid.size != 6u) {
+            WLH_LOGW("host-sim", "scan result has invalid BSSID length");
+            continue;
+        }
+        WLH_LOGI(
+            "host-sim",
+            "Wi-Fi scan result scan_id=%u ssid=%s "
+            "bssid=%02x:%02x:%02x:%02x:%02x:%02x channel=%u rssi=%ld "
+            "security=%s",
+            result.scan_id,
+            ssid,
+            network->bssid.bytes[0],
+            network->bssid.bytes[1],
+            network->bssid.bytes[2],
+            network->bssid.bytes[3],
+            network->bssid.bytes[4],
+            network->bssid.bytes[5],
+            network->channel,
+            (long)network->rssi_dbm,
+            wifi_security_name(network->security)
+        );
+    }
+}
+
 static void host_event(void *context, const wlh_host_event_t *event) {
     app_t *app = context;
     pthread_mutex_lock(&app->state_mutex);
@@ -258,6 +334,8 @@ static void host_event(void *context, const wlh_host_event_t *event) {
         app->user_result_received = true;
     pthread_cond_broadcast(&app->state_changed);
     pthread_mutex_unlock(&app->state_mutex);
+    if (event->kind == WLH_HOST_EVENT_WIFI_SCAN_RESULT)
+        log_scan_results(event);
     WLH_LOGI(
         "host-sim",
         "event kind=%d state=%d service=%u method=%u bytes=%zu",
