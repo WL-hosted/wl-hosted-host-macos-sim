@@ -1,5 +1,5 @@
 core.url=https://github.com/WL-hosted/wl-hosted-core.git
-core.commit=967f2c92991d40e58c1500955c284aba6ccec5b8
+core.commit=f53738ddf6f3e48b00d0a8641d1075791ab43d31
 easylogger.url=https://github.com/armink/EasyLogger.git
 easylogger.commit=a596b2642e27af3a2dbdeb0e5f04a6b5b673ef24
 lwip.url=https://github.com/lwip-tcpip/lwip.git
