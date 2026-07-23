@@ -4,3 +4,6 @@
 [submodule "third_party/easylogger"]
 	path = third_party/easylogger
 	url = https://github.com/armink/EasyLogger.git
+[submodule "third_party/lwip"]
+	path = third_party/lwip
+	url = https://github.com/lwip-tcpip/lwip.git

@@ -1,3 +1,4 @@
+#include "network.h"
 #include "sim.h"
 #include "transport_usb.h"
 #include "wlh/log.h"
@@ -23,6 +24,7 @@ typedef struct app {
     sim_executor_t tx_executor;
     wlh_posix_osal_t osal;
     wlh_host_t host;
+    sim_network_t *network;
 
     bool use_usb;
     sim_usb_config_t usb_config;
@@ -65,6 +67,14 @@ typedef struct lifecycle_work {
 } lifecycle_work_t;
 
 static atomic_bool interrupted = false;
+
+static int send_protobuf(
+    app_t *app,
+    uint8_t kind,
+    const pb_msgdesc_t *fields,
+    const void *message,
+    size_t maximum
+);
 
 static uint64_t monotonic_ms(void) {
     struct timespec value;
@@ -321,19 +331,49 @@ static void log_scan_results(const wlh_host_event_t *event) {
 
 static void host_event(void *context, const wlh_host_event_t *event) {
     app_t *app = context;
+    bool link_up = false;
+    bool link_down = false;
+    uint8_t interface_mac[6] = {0};
     pthread_mutex_lock(&app->state_mutex);
     if (event->kind == WLH_HOST_EVENT_WIFI_SCAN_COMPLETED)
         app->scan_complete = true;
-    if (event->kind == WLH_HOST_EVENT_WIFI_CONNECTED)
+    if (event->kind == WLH_HOST_EVENT_WIFI_CONNECTED) {
+        wlh_protocol_v1_WifiConnectedEvent connected =
+            wlh_protocol_v1_WifiConnectedEvent_init_zero;
+        pb_istream_t stream =
+            pb_istream_from_buffer(event->payload, event->payload_size);
         app->connected = true;
-    if (event->kind == WLH_HOST_EVENT_WIFI_DISCONNECTED)
+        if (pb_decode(
+                &stream, wlh_protocol_v1_WifiConnectedEvent_fields, &connected
+            ) &&
+            connected.has_link && connected.link.mac.size == 6u) {
+            memcpy(interface_mac, connected.link.mac.bytes, 6u);
+            link_up = true;
+        }
+    }
+    if (event->kind == WLH_HOST_EVENT_WIFI_DISCONNECTED) {
         app->disconnected = true;
-    if (event->kind == WLH_HOST_EVENT_ETHERNET_STA_RX)
+        link_down = true;
+    }
+    if (event->kind == WLH_HOST_EVENT_ETHERNET_STA_RX) {
         app->ethernet_rx = true;
+        if (app->network != NULL)
+            (void)sim_network_input(
+                app->network, event->payload, event->payload_size
+            );
+    }
     if (event->kind == WLH_HOST_EVENT_USER_MESSAGE_RESULT)
         app->user_result_received = true;
     pthread_cond_broadcast(&app->state_changed);
     pthread_mutex_unlock(&app->state_mutex);
+    if (link_up && app->network != NULL) {
+        if (sim_network_link_up(app->network, interface_mac) != 0)
+            WLH_LOGW("host-sim", "failed to bring lwIP netif up");
+    } else if (event->kind == WLH_HOST_EVENT_WIFI_CONNECTED && !link_up) {
+        WLH_LOGW("host-sim", "connected event omitted the STA MAC");
+    }
+    if (link_down && app->network != NULL)
+        sim_network_link_down(app->network);
     if (event->kind == WLH_HOST_EVENT_WIFI_SCAN_RESULT)
         log_scan_results(event);
     WLH_LOGI(
@@ -345,6 +385,73 @@ static void host_event(void *context, const wlh_host_event_t *event) {
         event->method_id,
         event->payload_size
     );
+}
+
+static int network_send(void *context, const uint8_t *frame, size_t size) {
+    app_t *app = context;
+    return wlh_host_ethernet_sta_send(&app->host, frame, size) == WLH_HOST_OK
+               ? 0
+               : -1;
+}
+
+static void network_ping_result(
+    void *context, const sim_ping_result_t *result
+) {
+    app_t *app = context;
+    wlh_sim_v1_SimPingResult message = wlh_sim_v1_SimPingResult_init_zero;
+    if (!app->ipc.sideband)
+        return;
+    message.request_id = result->request_id;
+    message.transmitted = result->transmitted;
+    message.received = result->received;
+    message.success = result->success;
+    (void)snprintf(
+        message.hostname, sizeof(message.hostname), "%s", result->hostname
+    );
+    (void)snprintf(
+        message.address, sizeof(message.address), "%s", result->address
+    );
+    (void)snprintf(
+        message.detail, sizeof(message.detail), "%s", result->detail
+    );
+    if (send_protobuf(
+            app,
+            SIM_RECORD_PING_RESULT,
+            wlh_sim_v1_SimPingResult_fields,
+            &message,
+            wlh_sim_v1_SimPingResult_size
+        ) != 0)
+        WLH_LOGW("host-sim", "failed to send ping result");
+}
+
+static void handle_ping_command(
+    app_t *app, const uint8_t *payload, size_t payload_size
+) {
+    wlh_sim_v1_SimPingCommand message = wlh_sim_v1_SimPingCommand_init_zero;
+    pb_istream_t stream = pb_istream_from_buffer(payload, payload_size);
+    if (!pb_decode(&stream, wlh_sim_v1_SimPingCommand_fields, &message) ||
+        message.request_id == 0u || message.hostname[0] == '\0' ||
+        message.count == 0u || message.count > 10u ||
+        message.timeout_ms == 0u || message.timeout_ms > 60000u ||
+        app->network == NULL ||
+        sim_network_ping(
+            app->network,
+            message.request_id,
+            message.hostname,
+            message.count,
+            message.timeout_ms
+        ) != 0) {
+        sim_ping_result_t result;
+        memset(&result, 0, sizeof(result));
+        result.request_id = message.request_id;
+        (void)snprintf(
+            result.hostname, sizeof(result.hostname), "%s", message.hostname
+        );
+        (void)snprintf(
+            result.detail, sizeof(result.detail), "%s", "invalid ping command"
+        );
+        network_ping_result(app, &result);
+    }
 }
 
 static int send_protobuf(
@@ -617,6 +724,8 @@ static void *rx_main(void *context) {
             handle_fault(app, payload, payload_size);
         } else if (kind == SIM_RECORD_WIFI_COMMAND && app->ipc.sideband) {
             handle_wifi_command(app, payload, payload_size);
+        } else if (kind == SIM_RECORD_PING_COMMAND && app->ipc.sideband) {
+            handle_ping_command(app, payload, payload_size);
         }
         free(payload);
     }
@@ -938,6 +1047,13 @@ int main(int argc, char **argv) {
 
     if (wlh_host_init(&app.host, &config) != WLH_HOST_OK)
         return 1;
+    app.network = sim_network_create(
+        &config.osal, network_send, network_ping_result, &app
+    );
+    if (app.network == NULL) {
+        WLH_LOGE("host-sim", "lwIP initialization failed");
+        return 1;
+    }
     app.started_ms = monotonic_ms();
     atomic_store(&app.running, true);
 
@@ -950,6 +1066,8 @@ int main(int argc, char **argv) {
         result = run_scenario(&app, scenario);
     send_runtime(&app);
 
+    sim_network_destroy(app.network);
+    app.network = NULL;
     (void)wlh_host_stop(&app.host);
     sim_executor_stop(&app.tx_executor);
     atomic_store(&app.running, false);

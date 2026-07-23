@@ -174,7 +174,7 @@ int sim_ipc_write(
     int result;
 
     if (ipc == NULL || ipc->fd < 0 || kind < SIM_RECORD_WIRE_FRAME ||
-        kind > SIM_RECORD_WIFI_COMMAND ||
+        kind > SIM_RECORD_PING_RESULT ||
         (payload_size != 0u && payload == NULL) ||
         body_size > ipc->max_record_size)
         return -1;
@@ -212,9 +212,8 @@ int sim_ipc_read(
     body_size = read32(length_bytes);
     if (body_size < 4u || body_size > ipc->max_record_size ||
         read_all(ipc->fd, fixed, sizeof(fixed)) != 0 ||
-        fixed[0] < SIM_RECORD_WIRE_FRAME ||
-        fixed[0] > SIM_RECORD_WIFI_COMMAND || fixed[1] != 0u ||
-        fixed[2] != 0u || fixed[3] != 0u)
+        fixed[0] < SIM_RECORD_WIRE_FRAME || fixed[0] > SIM_RECORD_PING_RESULT ||
+        fixed[1] != 0u || fixed[2] != 0u || fixed[3] != 0u)
         return -1;
 
     *payload_size = body_size - 4u;

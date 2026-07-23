@@ -34,13 +34,33 @@ endif()
 # includes wlh/log.h with the EASYLOGGER backend selected.
 target_link_libraries(wlh_log_backend PUBLIC wlh::easylogger)
 
+set(LWIP_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/lwip")
+set(LWIP_EXCLUDE_SLIPIF TRUE)
+include("${LWIP_DIR}/src/Filelists.cmake")
+add_library(wlh_host_sim_lwip STATIC
+    ${lwipcore_SRCS}
+    ${lwipcore4_SRCS}
+    "${LWIP_DIR}/src/api/tcpip.c"
+    "${LWIP_DIR}/src/netif/ethernet.c"
+    src/lwip_port/sys_arch.c)
+target_include_directories(wlh_host_sim_lwip
+    PUBLIC
+        "${LWIP_DIR}/src/include"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/lwip_port")
+target_compile_features(wlh_host_sim_lwip PUBLIC c_std_11)
+target_link_libraries(wlh_host_sim_lwip PUBLIC wlh::osal Threads::Threads)
+
 add_library(wlh_host_sim_platform STATIC
-    src/ipc.c src/executor.c src/transport_usb.c)
+    src/ipc.c src/executor.c src/transport_usb.c src/network.c)
 target_include_directories(wlh_host_sim_platform
     PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_compile_features(wlh_host_sim_platform PUBLIC c_std_11)
 target_link_libraries(wlh_host_sim_platform
-    PUBLIC Threads::Threads PkgConfig::LIBUSB wlh::log)
+    PUBLIC
+        Threads::Threads
+        PkgConfig::LIBUSB
+        wlh::log
+        wlh_host_sim_lwip)
 
 add_executable(wlh-host-macos-sim src/main.c)
 target_compile_features(wlh-host-macos-sim PRIVATE c_std_11)
@@ -49,7 +69,7 @@ target_link_libraries(wlh-host-macos-sim PRIVATE
     wlh_host_sim_platform wlh::host_core wlh::posix_osal wlh::log
     wlh_sim_nanopb Threads::Threads)
 
-foreach(target wlh_host_sim_platform wlh-host-macos-sim)
+foreach(target wlh_host_sim_lwip wlh_host_sim_platform wlh-host-macos-sim)
     set_target_properties(${target} PROPERTIES C_EXTENSIONS OFF)
     if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
         target_compile_options(${target} PRIVATE -Wall -Wextra -Wpedantic -Werror)

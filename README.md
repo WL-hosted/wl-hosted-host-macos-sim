@@ -17,6 +17,9 @@ wl-hosted-host-macos-sim -> wl-hosted-core/host-core
 - `core/host-core`：平台无关的 Host Core，包含状态机、RPC 超时、credit 管理、Hello 协商等。
 - `core/protocol`：标准 Wire/RPC codec、protobuf/nanopb schema、Simulator IPC sideband schema。
 - `core/common`：共享平台契约，OSAL 唯一来源位于 `osal/include/wlh/osal.h`；`wlh_posix_osal` 由 Common 提供，供本仓库启用。
+- `third_party/lwip`：Host 侧 IPv4、DHCP、DNS 和 ICMP 栈。lwIP
+  运行于 `NO_SYS=0` 模式，其 `sys_arch` 复用 `wlh_posix_osal` 的线程、
+  队列、semaphore、mutex 和 monotonic time。
 
 本仓库的角色固定为 `HOST_SIM`。当通过 `--ipc` 直接连接对端（Manager 或 Coproc Sim）时，会自动启用 sideband 运行时/故障注入通道；当通过 `--usb` 连接真实 Coprocessor 时，只传输标准 WL-hosted wire 帧，sideband 关闭。
 
@@ -26,11 +29,18 @@ wl-hosted-host-macos-sim -> wl-hosted-core/host-core
 - CMake >= 3.20
 - C11 编译器（Clang 或 GCC）
 - libusb-1.0（USB 真实设备模式必需）
+- lwIP 2.2.1（固定于 `third_party/lwip` 子模块）
 
 安装 libusb：
 
 ```sh
 brew install libusb
+```
+
+首次检出后初始化全部依赖：
+
+```sh
+git submodule update --init --recursive
 ```
 
 ## 3. 构建步骤
@@ -131,7 +141,7 @@ ctest --test-dir build-asan --output-on-failure
 | `scan` | 初始化 Wi-Fi，执行一次 BSS 扫描，等待 `WLH_HOST_EVENT_WIFI_SCAN_COMPLETED` 事件。 |
 | `connect` | 在 `scan` 的基础上，使用 `--ssid`/`--credential` 连接指定 AP，等待 `WLH_HOST_EVENT_WIFI_CONNECTED`，发送 Ethernet echo 帧并等待 `WLH_HOST_EVENT_ETHERNET_STA_RX`，最后断开并等待 `WLH_HOST_EVENT_WIFI_DISCONNECTED`。 |
 | `services` | 调用 Device Information 服务获取厂商/板级/UID 信息，并发送一条 User Passthrough 消息等待 completion；还会短暂等待可选的 `USER_MESSAGE_RESULT` 事件。 |
-| `managed` | Manager 驱动模式：等待 READY 后自动执行一次 Wi-Fi INITIALIZE（对端已初始化时容忍失败），随后长期驻留，通过 sideband 接收 Manager 下发的 `SIM_RECORD_WIFI_COMMAND`（scan / connect / disconnect / start_ap / stop_ap）并转换为标准 Wi-Fi RPC；链路断开后自动重新等待 READY 并重新 INITIALIZE，直到收到退出信号。仅 IPC + sideband 模式有效；USB `--usb` 独立运行模式行为不变。 |
+| `managed` | Manager 驱动模式：等待 READY 后自动执行一次 Wi-Fi INITIALIZE（对端已初始化时容忍失败），随后长期驻留，通过 sideband 接收 Manager 下发的 `SIM_RECORD_WIFI_COMMAND`（scan / connect / disconnect / start_ap / stop_ap）并转换为标准 Wi-Fi RPC；也可接收 `SIM_RECORD_PING_COMMAND`，由 `NO_SYS=0` lwIP 通过 STA Ethernet 数据面完成 DHCP、DNS 和 ICMP ping 并返回 `SIM_RECORD_PING_RESULT`。链路断开后自动重新等待 READY 并重新 INITIALIZE，直到收到退出信号。仅 IPC + sideband 模式有效；USB `--usb` 独立运行模式行为不变。 |
 
 ## 7. 架构与线程模型
 
