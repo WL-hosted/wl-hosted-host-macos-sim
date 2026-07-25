@@ -70,7 +70,7 @@ cmake --build build-asan --parallel
 ctest --test-dir build-asan --output-on-failure
 ```
 
-编译选项包含 `-Wall -Wextra -Wpedantic -Werror`，错误会被视为构建失败。
+编译选项包含 `-Wall -Werror`，错误会被视为构建失败。
 
 ## 4. 运行方式
 

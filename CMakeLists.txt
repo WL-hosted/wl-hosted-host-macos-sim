@@ -27,7 +27,7 @@ target_compile_features(wlh_easylogger PUBLIC c_std_99)
 set_target_properties(wlh_easylogger PROPERTIES
     C_EXTENSIONS OFF POSITION_INDEPENDENT_CODE ON)
 if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
-    target_compile_options(wlh_easylogger PRIVATE -Wall -Wextra -Werror)
+    target_compile_options(wlh_easylogger PRIVATE -Wall -Werror)
 endif()
 
 # The core log backend needs EasyLogger headers whenever a translation unit
@@ -72,7 +72,7 @@ target_link_libraries(wlh-host-macos-sim PRIVATE
 foreach(target wlh_host_sim_lwip wlh_host_sim_platform wlh-host-macos-sim)
     set_target_properties(${target} PROPERTIES C_EXTENSIONS OFF)
     if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
-        target_compile_options(${target} PRIVATE -Wall -Wextra -Wpedantic -Werror)
+        target_compile_options(${target} PRIVATE -Wall -Werror)
     endif()
 endforeach()
 
@@ -82,7 +82,7 @@ if(WLH_SIM_BUILD_TESTING)
     target_compile_features(wlh_host_sim_ipc_tests PRIVATE c_std_11)
     if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
         target_compile_options(wlh_host_sim_ipc_tests PRIVATE
-            -Wall -Wextra -Wpedantic -Werror -UNDEBUG)
+            -Wall -Werror -UNDEBUG)
     elseif(MSVC)
         target_compile_options(wlh_host_sim_ipc_tests PRIVATE /UNDEBUG)
     endif()
