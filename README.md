@@ -274,7 +274,7 @@ ctest --test-dir build-debug --output-on-failure
 本仓库遵循工作区统一的 `.clang-format`。不要手动格式化，应从工作区根目录运行：
 
 ```sh
-./auto_format.sh
+./wl-hosted-tools/auto_format.sh
 ```
 
 该脚本会格式化 Protocol、Common、两个 Core、两个 Sim 和 Manager 中的 C/C++ 文件，并排除 submodule、`third_party`、生成的 `*.pb.*`、构建目录和 Rust `target`。
