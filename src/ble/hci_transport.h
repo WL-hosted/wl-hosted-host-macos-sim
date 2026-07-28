@@ -5,6 +5,7 @@
 #include <stdint.h>
 
 #include "wlh/host.h"
+#include "wlh/osal.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -18,8 +19,10 @@ wlh_host_result_t wlh_ble_hci_rx(
 void wlh_ble_hci_tx_ready(void *context);
 
 /* Attach after nimble_port_init (transport pools and the default event queue
- * must exist) and before the NimBLE host starts issuing HCI commands. */
-void wlh_ble_transport_attach(wlh_host_t *host);
+ * must exist) and before the NimBLE host starts issuing HCI commands. The
+ * osal ops back a dedicated RX delivery task that must never be the same task
+ * that blocks inside ble_hs_hci_cmd_tx, or command-complete acks deadlock. */
+void wlh_ble_transport_attach(wlh_host_t *host, const wlh_osal_ops_t *osal);
 
 /* Detach on stop or USB loss: drops all pending TX buffers and ignores any
  * further Core callbacks. Safe to call repeatedly. Must run while the NimBLE

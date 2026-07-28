@@ -467,7 +467,7 @@ int wlh_ble_app_start(
         return -1;
     }
     nimble_port_init();
-    wlh_ble_transport_attach(host);
+    wlh_ble_transport_attach(host, osal);
     ble_app.nimble_ready = true;
 
     if (wlh_ble_bond_store_init(opts->bond_store_path, opts->clear_bonds) != 0)

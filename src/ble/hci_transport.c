@@ -3,11 +3,14 @@
  * TX (NimBLE -> Core): ble_transport_to_ll_cmd/acl_impl run on whichever
  * task drives the NimBLE host. WLH_HOST_NO_CREDIT keeps ownership of the
  * NimBLE buffer in a bounded pending queue; bluetooth_hci_tx_ready posts an
- * event so the retry happens on the NimBLE host task, never on the Core
- * task.
+ * event so the retry happens on the dedicated transport task (see below),
+ * never on the Core task and never on the blockable NimBLE host task.
  *
  * RX (Core -> NimBLE): the Core callback only copies into a bounded ring and
- * signals; the NimBLE host task allocates transport buffers and delivers.
+ * signals; a dedicated RX task (never the NimBLE host task) allocates transport
+ * buffers and delivers. The host task blocks inside ble_hs_hci_cmd_tx awaiting
+ * the command-complete ack, so delivering acks from that same task would
+ * deadlock; a separate task releases ble_hs_hci_sem while the host task waits.
  * A full ring withholds the channel credit (WLH_HOST_PENDING_FULL) so the
  * coprocessor backpressures. Transport pool exhaustion keeps the packet in
  * the ring and retries via callout, which also re-opens credit flow once
@@ -53,7 +56,7 @@ typedef struct rx_slot {
 static wlh_host_t *transport_host;
 static atomic_bool transport_attached;
 
-/* Single-producer (Core task) / single-consumer (NimBLE host task) ring. */
+/* Single-producer (Core task) / single-consumer (dedicated RX task) ring. */
 static rx_slot_t rx_ring[RX_RING_SLOTS];
 static atomic_uint_fast32_t rx_head;
 static atomic_uint_fast32_t rx_tail;
@@ -69,22 +72,54 @@ static struct ble_npl_event tx_ready_event;
 static struct ble_npl_event rx_event;
 static struct ble_npl_callout rx_retry;
 
+/* Dedicated transport task: services rx_event, tx_ready_event and the rx_retry
+   callout on its own event queue so ack delivery never waits on the NimBLE
+   host task, which blocks inside ble_hs_hci_cmd_tx. */
+static const wlh_osal_ops_t *transport_osal;
+static struct ble_npl_eventq transport_evq;
+static wlh_osal_task_t transport_task;
+static atomic_bool transport_task_running;
+static bool transport_task_created;
+
 static void transport_tx_drain(struct ble_npl_event *ev);
 static void transport_rx_drain(struct ble_npl_event *ev);
 
-void wlh_ble_transport_attach(wlh_host_t *host) {
+static void transport_task_fn(void *argument) {
+    (void)argument;
+    while (atomic_load(&transport_task_running)) {
+        struct ble_npl_event *event = ble_npl_eventq_get(&transport_evq, 50u);
+        if (event != NULL)
+            ble_npl_event_run(event);
+    }
+}
+
+void wlh_ble_transport_attach(wlh_host_t *host, const wlh_osal_ops_t *osal) {
+    wlh_osal_task_attributes_t attributes;
     atomic_store(&rx_head, 0u);
     atomic_store(&rx_tail, 0u);
     pending_cmd = NULL;
     memset(pending_acl, 0, sizeof(pending_acl));
     pending_acl_head = 0u;
     pending_acl_count = 0u;
+    transport_osal = osal;
+    ble_npl_eventq_init(&transport_evq);
     ble_npl_event_init(&tx_ready_event, transport_tx_drain, NULL);
     ble_npl_event_init(&rx_event, transport_rx_drain, NULL);
-    ble_npl_callout_init(
-        &rx_retry, nimble_port_get_dflt_eventq(), transport_rx_drain, NULL
-    );
+    ble_npl_callout_init(&rx_retry, &transport_evq, transport_rx_drain, NULL);
     transport_host = host;
+
+    atomic_store(&transport_task_running, true);
+    memset(&attributes, 0, sizeof(attributes));
+    attributes.name = "ble-hci-rx";
+    if (osal->task_create(
+            osal->context, &transport_task, &attributes, transport_task_fn, NULL
+        ) != 0) {
+        atomic_store(&transport_task_running, false);
+        transport_host = NULL;
+        WLH_LOGE("host-ble", "cannot start HCI transport task");
+        return;
+    }
+    transport_task_created = true;
     atomic_store(&transport_attached, true);
 }
 
@@ -93,6 +128,13 @@ void wlh_ble_transport_detach(void) {
     if (!atomic_exchange(&transport_attached, false))
         return;
     ble_npl_callout_stop(&rx_retry);
+    if (transport_task_created) {
+        atomic_store(&transport_task_running, false);
+        (void)transport_osal->task_join(
+            transport_osal->context, &transport_task, 3000u
+        );
+        transport_task_created = false;
+    }
     if (pending_cmd != NULL) {
         ble_transport_free(pending_cmd);
         pending_cmd = NULL;
@@ -232,7 +274,7 @@ void wlh_ble_hci_tx_ready(void *context) {
     (void)context;
     if (!atomic_load(&transport_attached))
         return;
-    ble_npl_eventq_put(nimble_port_get_dflt_eventq(), &tx_ready_event);
+    ble_npl_eventq_put(&transport_evq, &tx_ready_event);
 }
 
 wlh_host_result_t wlh_ble_hci_rx(
@@ -254,7 +296,7 @@ wlh_host_result_t wlh_ble_hci_rx(
     slot->size = (uint16_t)payload_size;
     memcpy(slot->data, payload, payload_size);
     atomic_store_explicit(&rx_head, head + 1u, memory_order_release);
-    ble_npl_eventq_put(nimble_port_get_dflt_eventq(), &rx_event);
+    ble_npl_eventq_put(&transport_evq, &rx_event);
     return WLH_HOST_OK;
 }
 
