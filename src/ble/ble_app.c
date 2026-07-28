@@ -28,6 +28,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #define BLE_DEFAULT_STEP_TIMEOUT_MS 30000u
 #define BLE_RPC_TIMEOUT_MS 5000u
@@ -867,6 +868,25 @@ static int on_read(
     return 0;
 }
 
+/* ble_gap_disc_cancel() stops discovery, but the controller scan-disable
+ * command-complete that releases the master GAP slot is processed on the
+ * transport task. Issuing ble_gap_connect() before it lands returns
+ * BLE_HS_EBUSY, so poll until discovery is actually inactive. */
+static bool wait_disc_inactive(uint32_t timeout_ms) {
+    const uint32_t step_ms = 5u;
+    uint32_t waited = 0u;
+    while (ble_gap_disc_active() != 0) {
+        struct timespec ts;
+        if (waited >= timeout_ms)
+            return false;
+        ts.tv_sec = 0;
+        ts.tv_nsec = (long)step_ms * 1000000L;
+        (void)nanosleep(&ts, NULL);
+        waited += step_ms;
+    }
+    return true;
+}
+
 int wlh_ble_run_central(void) {
     struct ble_gap_disc_params disc_params;
     uint8_t own_addr_type;
@@ -939,7 +959,15 @@ int wlh_ble_run_central(void) {
             (void)ble_gap_disc_cancel();
             return -1;
         }
-        (void)ble_gap_disc_cancel();
+        rc = ble_gap_disc_cancel();
+        if (rc != 0 && rc != BLE_HS_EALREADY) {
+            WLH_LOGE("host-ble", "scan cancel failed rc=%d", rc);
+            return -1;
+        }
+        if (!wait_disc_inactive(timeout)) {
+            WLH_LOGE("host-ble", "central: scan did not stop before connect");
+            return -1;
+        }
     }
     WLH_LOGI(
         "host-ble",
@@ -953,14 +981,21 @@ int wlh_ble_run_central(void) {
         ble_app.peer_addr.type
     );
 
-    rc = ble_gap_connect(
-        own_addr_type,
-        &ble_app.peer_addr,
-        (int32_t)timeout,
-        NULL,
-        central_gap_event,
-        NULL
-    );
+    rc = BLE_HS_EBUSY;
+    for (int attempt = 0; attempt < 20 && rc == BLE_HS_EBUSY; ++attempt) {
+        if (attempt != 0) {
+            struct timespec ts = {0, 5L * 1000000L};
+            (void)nanosleep(&ts, NULL);
+        }
+        rc = ble_gap_connect(
+            own_addr_type,
+            &ble_app.peer_addr,
+            (int32_t)timeout,
+            NULL,
+            central_gap_event,
+            NULL
+        );
+    }
     if (rc != 0) {
         WLH_LOGE("host-ble", "connect start failed rc=%d", rc);
         return -1;
