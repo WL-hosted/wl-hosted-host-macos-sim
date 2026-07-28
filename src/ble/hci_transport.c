@@ -11,10 +11,12 @@
  * buffers and delivers. The host task blocks inside ble_hs_hci_cmd_tx awaiting
  * the command-complete ack, so delivering acks from that same task would
  * deadlock; a separate task releases ble_hs_hci_sem while the host task waits.
- * A full ring withholds the channel credit (WLH_HOST_PENDING_FULL) so the
- * coprocessor backpressures. Transport pool exhaustion keeps the packet in
- * the ring and retries via callout, which also re-opens credit flow once
- * buffers return.
+ * The Core returns the channel credit whether or not the callback accepts a
+ * packet, so reliable delivery is this adapter's job: the ring caps how many
+ * best-effort advertising reports it holds so reliable HCI always finds a
+ * slot, and the reliable-channel credit window is smaller than that reserve.
+ * Transport pool exhaustion keeps the packet in the ring and retries via
+ * callout.
  */
 
 #include "hci_transport.h"
@@ -38,11 +40,12 @@
 #define HCI_H4_ACL 0x02u
 #define HCI_H4_EVT 0x04u
 
-#define HCI_EVT_LE_META 0x3eu
-#define HCI_LE_SUBEV_ADV_REPORT 0x02u
-#define HCI_LE_SUBEV_EXT_ADV_REPORT 0x0du
-
 #define RX_RING_SLOTS 32u
+/* Advertising reports never occupy more than this many ring slots; the rest
+   stay reserved for reliable HCI. Must be at least the reliable-channel
+   credit window (WLH_COPROC_BLUETOOTH_INITIAL_CREDIT, 16) away from
+   RX_RING_SLOTS so a reliable event always finds a slot. */
+#define RX_ADV_SLOTS_LIMIT 16u
 #define RX_RETRY_TICKS 10u
 #define TX_PENDING_ACL_SLOTS 16u
 #define HCI_TRANSPORT_ERROR 0x07 /* BLE_ERR_MEM_CAPACITY */
@@ -281,6 +284,7 @@ wlh_host_result_t wlh_ble_hci_rx(
     void *context, uint8_t h4_type, const uint8_t *payload, size_t payload_size
 ) {
     uint32_t head;
+    uint32_t used;
     rx_slot_t *slot;
     (void)context;
     if (!atomic_load(&transport_attached))
@@ -288,9 +292,13 @@ wlh_host_result_t wlh_ble_hci_rx(
     if (payload_size == 0u || payload_size > WLH_HOST_MAX_HCI_PACKET)
         return WLH_HOST_PROTOCOL_ERROR;
     head = (uint32_t)atomic_load_explicit(&rx_head, memory_order_relaxed);
-    if (head - (uint32_t)atomic_load_explicit(&rx_tail, memory_order_acquire) >=
-        RX_RING_SLOTS)
+    used =
+        head - (uint32_t)atomic_load_explicit(&rx_tail, memory_order_acquire);
+    if (used >= RX_RING_SLOTS)
         return WLH_HOST_PENDING_FULL;
+    if (used >= RX_ADV_SLOTS_LIMIT && h4_type == HCI_H4_EVT &&
+        wlh_hci_event_is_adv_report(payload, payload_size))
+        return WLH_HOST_OK; /* Shed reports; keep slots for reliable HCI. */
     slot = &rx_ring[head % RX_RING_SLOTS];
     slot->h4_type = h4_type;
     slot->size = (uint16_t)payload_size;
@@ -302,9 +310,7 @@ wlh_host_result_t wlh_ble_hci_rx(
 
 static bool transport_deliver_evt(const rx_slot_t *slot) {
     void *buf;
-    int discardable = slot->size >= 3u && slot->data[0] == HCI_EVT_LE_META &&
-                      (slot->data[2] == HCI_LE_SUBEV_ADV_REPORT ||
-                       slot->data[2] == HCI_LE_SUBEV_EXT_ADV_REPORT);
+    int discardable = wlh_hci_event_is_adv_report(slot->data, slot->size);
     if (slot->size < 2u || slot->size > MYNEWT_VAL(BLE_TRANSPORT_EVT_SIZE))
         return true; /* Cannot represent: count as consumed drop. */
     buf = ble_transport_alloc_evt(discardable);
