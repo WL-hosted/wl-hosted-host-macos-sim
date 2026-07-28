@@ -941,7 +941,12 @@ int wlh_ble_run_central(void) {
     } else {
         memset(&disc_params, 0, sizeof(disc_params));
         disc_params.passive = 0u;
-        disc_params.filter_duplicates = 1u;
+        /* Advertising reports are best-effort end to end: the coprocessor and
+           the RX ring may shed them under load. With controller duplicate
+           filtering a peer is reported once and a shed report is lost for the
+           whole scan, so let every advertising interval produce a fresh
+           report instead. */
+        disc_params.filter_duplicates = 0u;
         WLH_LOGI("host-ble", "central: scanning for test-service peer");
         rc = ble_gap_disc(
             own_addr_type,
