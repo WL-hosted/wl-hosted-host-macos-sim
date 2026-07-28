@@ -25,9 +25,6 @@ wl-hosted-host-macos-sim -> wl-hosted-core/host-core
   `wlh_posix_osal` 之上，不额外引入直接的 pthread 依赖。
 - `third_party/mbedtls`：Mbed-TLS 3.6.6，仅用于 NimBLE Security Manager 的
   AES-CMAC / ECDH（LE Secure Connections）加密原语。
-- `third_party/mynewt-core`：Apache Mynewt Core 1.15.0，随 NimBLE 官方发布配套
-  固定，供后续可选组件参考；当前构建不直接编译其源码。
-
 本仓库的角色固定为 `HOST_SIM`。当通过 `--ipc` 直接连接对端（Manager 或 Coproc Sim）时，会自动启用 sideband 运行时/故障注入通道；当通过 `--usb` 连接真实 Coprocessor 时，只传输标准 WL-hosted wire 帧，sideband 关闭。
 
 ## 2. 构建要求
@@ -37,11 +34,11 @@ wl-hosted-host-macos-sim -> wl-hosted-core/host-core
 - C11 编译器（Clang 或 GCC）
 - libusb-1.0（USB 真实设备模式必需）
 - lwIP 2.2.1（固定于 `third_party/lwip` 子模块）
-- Apache NimBLE 1.10.0、Mbed-TLS 3.6.6、Apache Mynewt Core 1.15.0
-  （分别固定于 `third_party/mynewt-nimble`、`third_party/mbedtls`、
-  `third_party/mynewt-core` 子模块；BLE 场景必需）
+- Apache NimBLE 1.10.0、Mbed-TLS 3.6.6
+  （分别固定于 `third_party/mynewt-nimble`、`third_party/mbedtls` 子模块；
+  BLE 场景必需）
 
-许可证：NimBLE 与 Mynewt Core 为 Apache-2.0，Mbed-TLS 为 Apache-2.0 / GPL-2.0
+许可证：NimBLE 为 Apache-2.0，Mbed-TLS 为 Apache-2.0 / GPL-2.0
 双许可（本项目按 Apache-2.0 使用）。各自完整声明见对应子模块目录下的
 `LICENSE` 文件。
 
@@ -290,7 +287,7 @@ ctest --test-dir build-debug --output-on-failure
 
 - `.gitmodules`
 - 各子模块 gitlink（`core/`、`third_party/lwip`、`third_party/easylogger`、
-  `third_party/mynewt-nimble`、`third_party/mbedtls`、`third_party/mynewt-core`）
+  `third_party/mynewt-nimble`、`third_party/mbedtls`）
 - `SUBMODULE.lock`
 
 更新子模块后应同步 `SUBMODULE.lock` 中的完整 40 字符 commit SHA，并确保每个

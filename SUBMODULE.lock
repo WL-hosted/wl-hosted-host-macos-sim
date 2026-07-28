@@ -6,7 +6,5 @@ lwip.url=https://github.com/lwip-tcpip/lwip.git
 lwip.commit=77dcd25a72509eb83f72b033d219b1d40cd8eb95
 mbedtls.url=https://github.com/Mbed-TLS/mbedtls.git
 mbedtls.commit=0bebf8b8c7f07abe3571ded48a11aa907a1ffb20
-mynewt-core.url=https://github.com/apache/mynewt-core.git
-mynewt-core.commit=ea2b7ebf6b285a2e293c4f172cbdeae7f2b6e8f3
 mynewt-nimble.url=https://github.com/apache/mynewt-nimble.git
 mynewt-nimble.commit=a7a156f28954819e158b62dd613008f22f9cf73b

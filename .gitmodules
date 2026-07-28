@@ -10,9 +10,6 @@
 [submodule "third_party/mynewt-nimble"]
 	path = third_party/mynewt-nimble
 	url = https://github.com/apache/mynewt-nimble.git
-[submodule "third_party/mynewt-core"]
-	path = third_party/mynewt-core
-	url = https://github.com/apache/mynewt-core.git
 [submodule "third_party/mbedtls"]
 	path = third_party/mbedtls
 	url = https://github.com/Mbed-TLS/mbedtls.git
