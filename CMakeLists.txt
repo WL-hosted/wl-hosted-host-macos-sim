@@ -62,12 +62,78 @@ target_link_libraries(wlh_host_sim_platform
         wlh::log
         wlh_host_sim_lwip)
 
+# --- BLE stack (NimBLE 1.10 + Mbed-TLS crypto) --------------------------------
+# NimBLE's Security Manager unconditionally pulls in Mbed-TLS (AES/CMAC/ECDH),
+# so we build the vendored crypto library and link it under the NimBLE host.
+set(ENABLE_PROGRAMS OFF CACHE BOOL "" FORCE)
+set(ENABLE_TESTING OFF CACHE BOOL "" FORCE)
+set(MBEDTLS_FATAL_WARNINGS OFF CACHE BOOL "" FORCE)
+set(GEN_FILES OFF CACHE BOOL "" FORCE)
+add_subdirectory(third_party/mbedtls EXCLUDE_FROM_ALL)
+
+set(NIMBLE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/mynewt-nimble")
+file(GLOB WLH_NIMBLE_HOST_SRCS CONFIGURE_DEPENDS "${NIMBLE_DIR}/nimble/host/src/*.c")
+# ble_gatts_lcl.c is a debug-only local GATT dump that hard-depends on the
+# Mynewt console package; it is not part of the host we ship.
+list(REMOVE_ITEM WLH_NIMBLE_HOST_SRCS
+    "${NIMBLE_DIR}/nimble/host/src/ble_gatts_lcl.c")
+add_library(wlh_nimble STATIC
+    ${WLH_NIMBLE_HOST_SRCS}
+    "${NIMBLE_DIR}/nimble/host/util/src/addr.c"
+    "${NIMBLE_DIR}/nimble/host/services/gap/src/ble_svc_gap.c"
+    "${NIMBLE_DIR}/nimble/host/services/gatt/src/ble_svc_gatt.c"
+    "${NIMBLE_DIR}/nimble/transport/src/transport.c"
+    "${NIMBLE_DIR}/porting/nimble/src/endian.c"
+    "${NIMBLE_DIR}/porting/nimble/src/mem.c"
+    "${NIMBLE_DIR}/porting/nimble/src/nimble_port.c"
+    "${NIMBLE_DIR}/porting/nimble/src/os_mbuf.c"
+    "${NIMBLE_DIR}/porting/nimble/src/os_mempool.c"
+    "${NIMBLE_DIR}/porting/nimble/src/os_msys.c"
+    # Our NimBLE NPL port over wlh::osal (no direct pthread use here).
+    src/ble/npl/npl_osal.c)
+target_include_directories(wlh_nimble
+    PUBLIC
+        # WL-hosted overrides MUST precede the upstream porting headers so our
+        # syscfg limits and NPL type definitions win the include search.
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/ble/syscfg"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/ble/npl/include"
+        "${NIMBLE_DIR}/nimble/include"
+        "${NIMBLE_DIR}/nimble/host/include"
+        "${NIMBLE_DIR}/nimble/host/util/include"
+        "${NIMBLE_DIR}/nimble/host/services/gap/include"
+        "${NIMBLE_DIR}/nimble/host/services/gatt/include"
+        "${NIMBLE_DIR}/nimble/transport/include"
+        "${NIMBLE_DIR}/porting/nimble/include"
+    PRIVATE
+        "${NIMBLE_DIR}/nimble/host/src")
+target_compile_features(wlh_nimble PUBLIC c_std_11)
+target_link_libraries(wlh_nimble PUBLIC wlh::osal mbedcrypto)
+set_target_properties(wlh_nimble PROPERTIES C_EXTENSIONS OFF)
+# Upstream NimBLE does not build clean under -Wall -Werror; keep it quiet.
+if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
+    target_compile_options(wlh_nimble PRIVATE -w)
+endif()
+
+# Our BLE adapter code (transport bridge, bond store, scenario driver).
+add_library(wlh_ble STATIC
+    src/ble/hci_transport.c
+    src/ble/bond_store.c
+    src/ble/ble_app.c)
+target_include_directories(wlh_ble PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src/ble)
+target_compile_features(wlh_ble PUBLIC c_std_11)
+target_link_libraries(wlh_ble
+    PUBLIC wlh_nimble wlh::host_core wlh::log wlh::posix_osal)
+set_target_properties(wlh_ble PROPERTIES C_EXTENSIONS OFF)
+if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
+    target_compile_options(wlh_ble PRIVATE -Wall -Werror)
+endif()
+
 add_executable(wlh-host-macos-sim src/main.c)
 target_compile_features(wlh-host-macos-sim PRIVATE c_std_11)
 target_compile_definitions(wlh-host-macos-sim PRIVATE WLH_ENABLE_TEST_HOOKS)
 target_link_libraries(wlh-host-macos-sim PRIVATE
     wlh_host_sim_platform wlh::host_core wlh::posix_osal wlh::log
-    wlh_sim_nanopb Threads::Threads)
+    wlh_sim_nanopb wlh_ble Threads::Threads)
 
 foreach(target wlh_host_sim_lwip wlh_host_sim_platform wlh-host-macos-sim)
     set_target_properties(${target} PROPERTIES C_EXTENSIONS OFF)
@@ -87,5 +153,19 @@ if(WLH_SIM_BUILD_TESTING)
         target_compile_options(wlh_host_sim_ipc_tests PRIVATE /UNDEBUG)
     endif()
     add_test(NAME wlh_host_sim_ipc COMMAND wlh_host_sim_ipc_tests)
+
+    add_executable(wlh_host_sim_npl_tests tests/test_npl.c)
+    target_link_libraries(wlh_host_sim_npl_tests PRIVATE wlh_nimble wlh::posix_osal Threads::Threads)
+    target_include_directories(wlh_host_sim_npl_tests PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/ble/npl")
+    target_compile_features(wlh_host_sim_npl_tests PRIVATE c_std_11)
+    set_target_properties(wlh_host_sim_npl_tests PROPERTIES C_EXTENSIONS OFF)
+    if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
+        target_compile_options(wlh_host_sim_npl_tests PRIVATE
+            -Wall -Werror -UNDEBUG)
+    elseif(MSVC)
+        target_compile_options(wlh_host_sim_npl_tests PRIVATE /UNDEBUG)
+    endif()
+    add_test(NAME wlh_host_sim_npl COMMAND wlh_host_sim_npl_tests)
 
 endif()

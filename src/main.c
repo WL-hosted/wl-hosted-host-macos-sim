@@ -18,6 +18,9 @@
 #include <pb_encode.h>
 #include <wifi.pb.h>
 
+#include "ble/ble_app.h"
+#include "ble/hci_transport.h"
+
 typedef struct app {
     sim_ipc_t ipc;
     sim_executor_t executor;
@@ -49,6 +52,15 @@ typedef struct app {
 
     uint64_t started_ms;
     uint32_t monitor_interval_ms;
+
+    wlh_osal_ops_t osal_ops;
+    wlh_ble_options_t ble;
+    pthread_t ping_thread;
+    bool ping_thread_started;
+    atomic_bool ping_worker_running;
+    unsigned ping_results;
+    unsigned ping_ok;
+    unsigned ping_target;
 } app_t;
 
 typedef struct tx_work {
@@ -399,8 +411,24 @@ static void network_ping_result(
 ) {
     app_t *app = context;
     wlh_sim_v1_SimPingResult message = wlh_sim_v1_SimPingResult_init_zero;
-    if (!app->ipc.sideband)
+    pthread_mutex_lock(&app->state_mutex);
+    app->ping_results++;
+    if (result->success)
+        app->ping_ok++;
+    pthread_cond_broadcast(&app->state_changed);
+    pthread_mutex_unlock(&app->state_mutex);
+    if (!app->ipc.sideband) {
+        WLH_LOGI(
+            "host-sim",
+            "ping %s (%s) %u/%u %s",
+            result->hostname,
+            result->address,
+            result->received,
+            result->transmitted,
+            result->success ? "ok" : "fail"
+        );
         return;
+    }
     message.request_id = result->request_id;
     message.transmitted = result->transmitted;
     message.received = result->received;
@@ -821,6 +849,130 @@ static int run_managed(app_t *app) {
     return atomic_load(&app->running) && !atomic_load(&interrupted) ? -1 : 0;
 }
 
+static bool ping_target_reached(app_t *app) {
+    return app->ping_ok >= app->ping_target;
+}
+
+static void *ping_worker(void *context) {
+    app_t *app = context;
+    uint32_t request_id = 0x40000000u;
+
+    while (atomic_load(&app->ping_worker_running)) {
+        unsigned before;
+        pthread_mutex_lock(&app->state_mutex);
+        before = app->ping_results;
+        pthread_mutex_unlock(&app->state_mutex);
+        if (sim_network_ping(
+                app->network, ++request_id, "one.one.one.one", 1u, 2000u
+            ) != 0) {
+            usleep(500000u);
+            continue;
+        }
+        pthread_mutex_lock(&app->state_mutex);
+        while (atomic_load(&app->ping_worker_running) &&
+               app->ping_results == before) {
+            struct timespec duration = relative_duration_ms(3000u);
+            if (pthread_cond_timedwait_relative_np(
+                    &app->state_changed, &app->state_mutex, &duration
+                ) != 0)
+                break;
+        }
+        pthread_mutex_unlock(&app->state_mutex);
+    }
+    return NULL;
+}
+
+static int coexistence_wifi_up(app_t *app) {
+    static const uint8_t default_ssid[] = "WPA2Net";
+    static const uint8_t default_credential[] = "password123";
+    wlh_wifi_connect_params_t connect = {
+        app->ssid != NULL ? (const uint8_t *)app->ssid : default_ssid,
+        app->ssid != NULL ? strlen(app->ssid) : sizeof(default_ssid) - 1u,
+        app->credential != NULL ? (const uint8_t *)app->credential
+                                : default_credential,
+        app->credential != NULL ? strlen(app->credential)
+                                : sizeof(default_credential) - 1u,
+        4u,
+        10000u
+    };
+
+    app->completions = 0u;
+    (void)wlh_host_wifi_initialize(&app->host, completion, app);
+    if (!wait_until(app, one_completion, 3000u))
+        return -1;
+    (void)wlh_host_wifi_connect(&app->host, &connect, completion, app);
+    if (!wait_until(app, connected, 20000u)) {
+        WLH_LOGE("host-sim", "coexistence: Wi-Fi connect failed");
+        return -1;
+    }
+
+    atomic_store(&app->ping_worker_running, true);
+    if (pthread_create(&app->ping_thread, NULL, ping_worker, app) != 0)
+        return -1;
+    app->ping_thread_started = true;
+    pthread_mutex_lock(&app->state_mutex);
+    app->ping_target = 1u;
+    pthread_mutex_unlock(&app->state_mutex);
+    if (!wait_until(app, ping_target_reached, 30000u)) {
+        WLH_LOGE("host-sim", "coexistence: DHCP/DNS/ICMP health check failed");
+        return -1;
+    }
+    WLH_LOGI("host-sim", "coexistence: Wi-Fi up, health checks running");
+    return 0;
+}
+
+static int run_ble_scenario(app_t *app, const char *scenario) {
+    bool coexist = strcmp(scenario, "ble-coexistence") == 0;
+    int result = 0;
+
+    if (!wait_until(app, ready, 5000u))
+        return -1;
+
+    if (coexist && coexistence_wifi_up(app) != 0)
+        result = -1;
+
+    if (result == 0) {
+        result = wlh_ble_app_start(&app->host, &app->osal_ops, &app->ble) == 0
+                     ? (strcmp(scenario, "ble-peripheral") == 0
+                            ? wlh_ble_run_peripheral()
+                            : wlh_ble_run_central())
+                     : -1;
+        wlh_ble_app_stop();
+    }
+
+    if (coexist) {
+        if (result == 0) {
+            pthread_mutex_lock(&app->state_mutex);
+            if (app->disconnected) {
+                WLH_LOGE("host-sim", "coexistence: Wi-Fi dropped during BLE");
+                result = -1;
+            }
+            app->ping_target = app->ping_ok + 10u;
+            pthread_mutex_unlock(&app->state_mutex);
+            if (result == 0 && !wait_until(app, ping_target_reached, 60000u)) {
+                WLH_LOGE(
+                    "host-sim", "coexistence: post-BLE ping quota not met"
+                );
+                result = -1;
+            }
+        }
+        if (app->ping_thread_started) {
+            atomic_store(&app->ping_worker_running, false);
+            pthread_mutex_lock(&app->state_mutex);
+            pthread_cond_broadcast(&app->state_changed);
+            pthread_mutex_unlock(&app->state_mutex);
+            pthread_join(app->ping_thread, NULL);
+            app->ping_thread_started = false;
+        }
+        pthread_mutex_lock(&app->state_mutex);
+        app->disconnected = false;
+        pthread_mutex_unlock(&app->state_mutex);
+        (void)wlh_host_wifi_disconnect(&app->host, completion, app);
+        (void)wait_until(app, disconnected, 3000u);
+    }
+    return result;
+}
+
 static int run_scenario(app_t *app, const char *scenario) {
     wlh_wifi_scan_params_t scan = {1u, NULL, 0u, true, 8u};
     static const uint8_t default_ssid[] = "WPA2Net";
@@ -848,6 +1000,18 @@ static int run_scenario(app_t *app, const char *scenario) {
     /* Managed mode owns its (longer) READY wait; skip the scenario gate. */
     if (strcmp(scenario, "managed") == 0)
         return run_managed(app);
+
+    if (strncmp(scenario, "ble-", 4u) == 0) {
+        if (!app->use_usb) {
+            WLH_LOGE(
+                "host-sim",
+                "BLE scenarios require --usb (HCI channel is not supported "
+                "over IPC)"
+            );
+            return -1;
+        }
+        return run_ble_scenario(app, scenario);
+    }
 
     if (!wait_until(app, ready, 5000u))
         return -1;
@@ -916,9 +1080,13 @@ static void usage(const char *program) {
     fprintf(
         stderr,
         "usage: %s --ipc connect:PATH|fd:N | --usb VID:PID [--scenario "
-        "smoke|scan|connect|recovery|services|managed] "
+        "smoke|scan|connect|recovery|services|managed|ble-central|"
+        "ble-peripheral|ble-coexistence] "
         "[--monitor-interval-ms N] [--rpc-timeout-ms N] "
-        "[--ssid SSID] [--credential CREDENTIAL]\n",
+        "[--ssid SSID] [--credential CREDENTIAL] "
+        "[--ble-bond-store PATH] [--ble-clear-bonds] "
+        "[--ble-io-cap no-io|display|keyboard|display-yes-no] "
+        "[--ble-passkey N] [--ble-peer-address ADDR] [--ble-timeout-ms N]\n",
         program
     );
 }
@@ -987,6 +1155,38 @@ int main(int argc, char **argv) {
             app.monitor_interval_ms = (uint32_t)strtoul(argv[index], NULL, 10);
         else if (strcmp(argv[index], "--rpc-timeout-ms") == 0 && ++index < argc)
             rpc_timeout_ms = (uint32_t)strtoul(argv[index], NULL, 10);
+        else if (strcmp(argv[index], "--ble-bond-store") == 0 && ++index < argc)
+            app.ble.bond_store_path = argv[index];
+        else if (strcmp(argv[index], "--ble-clear-bonds") == 0)
+            app.ble.clear_bonds = true;
+        else if (strcmp(argv[index], "--ble-io-cap") == 0 && ++index < argc) {
+            if (strcmp(argv[index], "no-io") == 0)
+                app.ble.io_cap = WLH_BLE_IO_CAP_NO_IO;
+            else if (strcmp(argv[index], "display") == 0)
+                app.ble.io_cap = WLH_BLE_IO_CAP_DISPLAY;
+            else if (strcmp(argv[index], "keyboard") == 0)
+                app.ble.io_cap = WLH_BLE_IO_CAP_KEYBOARD;
+            else if (strcmp(argv[index], "display-yes-no") == 0)
+                app.ble.io_cap = WLH_BLE_IO_CAP_DISPLAY_YES_NO;
+            else {
+                usage(argv[0]);
+                return 2;
+            }
+        } else if (strcmp(argv[index], "--ble-passkey") == 0 &&
+                   ++index < argc) {
+            char *end;
+            unsigned long value = strtoul(argv[index], &end, 10);
+            if (end == argv[index] || *end != '\0' || value > 999999ul) {
+                usage(argv[0]);
+                return 2;
+            }
+            app.ble.passkey = (uint32_t)value;
+            app.ble.have_passkey = true;
+        } else if (strcmp(argv[index], "--ble-peer-address") == 0 &&
+                   ++index < argc)
+            app.ble.peer_address = argv[index];
+        else if (strcmp(argv[index], "--ble-timeout-ms") == 0 && ++index < argc)
+            app.ble.timeout_ms = (uint32_t)strtoul(argv[index], NULL, 10);
         else {
             usage(argv[0]);
             return 2;
@@ -1030,13 +1230,18 @@ int main(int argc, char **argv) {
         &app, transport_start, transport_stop, transport_submit};
     config.buffers = (wlh_buffer_ops_t){
         &app, buffer_alloc, buffer_free};
-    config.osal = wlh_posix_osal_ops(&app.osal);
+    app.osal_ops = wlh_posix_osal_ops(&app.osal);
+    config.osal = app.osal_ops;
     config.executor = (wlh_executor_ops_t){
         &app.executor, sim_executor_post};
     // clang-format on
 
     config.on_event = host_event;
     config.event_context = &app;
+
+    config.bluetooth_hci_rx = wlh_ble_hci_rx;
+    config.bluetooth_hci_tx_ready = wlh_ble_hci_tx_ready;
+    config.bluetooth_context = NULL;
 
     config.max_frame_size = 4096u;
     config.rpc_timeout_ms = rpc_timeout_ms;
