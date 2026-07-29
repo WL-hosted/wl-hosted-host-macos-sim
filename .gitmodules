@@ -13,3 +13,9 @@
 [submodule "third_party/mbedtls"]
 	path = third_party/mbedtls
 	url = https://github.com/Mbed-TLS/mbedtls.git
+[submodule "third_party/linenoise"]
+	path = third_party/linenoise
+	url = https://github.com/antirez/linenoise.git
+[submodule "third_party/cJSON"]
+	path = third_party/cJSON
+	url = https://github.com/DaveGamble/cJSON.git

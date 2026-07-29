@@ -128,12 +128,29 @@ if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
     target_compile_options(wlh_ble PRIVATE -Wall -Werror)
 endif()
 
-add_executable(wlh-host-macos-sim src/main.c)
+# --- REPL third-party deps (linenoise + cJSON, vendored submodules) ----------
+add_library(wlh_linenoise STATIC third_party/linenoise/linenoise.c)
+target_include_directories(wlh_linenoise PUBLIC third_party/linenoise)
+target_compile_features(wlh_linenoise PUBLIC c_std_11)
+set_target_properties(wlh_linenoise PROPERTIES C_EXTENSIONS OFF)
+if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
+    target_compile_options(wlh_linenoise PRIVATE -w)
+endif()
+
+add_library(wlh_cjson STATIC third_party/cJSON/cJSON.c)
+target_include_directories(wlh_cjson PUBLIC third_party)
+target_compile_features(wlh_cjson PUBLIC c_std_11)
+set_target_properties(wlh_cjson PROPERTIES C_EXTENSIONS OFF)
+if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
+    target_compile_options(wlh_cjson PRIVATE -w)
+endif()
+
+add_executable(wlh-host-macos-sim src/main.c src/repl.c src/repl_json.c)
 target_compile_features(wlh-host-macos-sim PRIVATE c_std_11)
 target_compile_definitions(wlh-host-macos-sim PRIVATE WLH_ENABLE_TEST_HOOKS)
 target_link_libraries(wlh-host-macos-sim PRIVATE
     wlh_host_sim_platform wlh::host_core wlh::posix_osal wlh::log
-    wlh_sim_nanopb wlh_ble Threads::Threads)
+    wlh_sim_nanopb wlh_ble wlh_linenoise wlh_cjson Threads::Threads)
 if(APPLE)
     target_link_libraries(wlh-host-macos-sim PRIVATE "-framework CoreFoundation")
 endif()
@@ -170,5 +187,22 @@ if(WLH_SIM_BUILD_TESTING)
         target_compile_options(wlh_host_sim_npl_tests PRIVATE /UNDEBUG)
     endif()
     add_test(NAME wlh_host_sim_npl COMMAND wlh_host_sim_npl_tests)
+
+    add_executable(wlh_host_sim_repl_json_tests
+        tests/test_repl_json.c src/repl_json.c)
+    target_include_directories(wlh_host_sim_repl_json_tests PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/src")
+    target_link_libraries(wlh_host_sim_repl_json_tests PRIVATE
+        wlh_cjson Threads::Threads)
+    target_compile_features(wlh_host_sim_repl_json_tests PRIVATE c_std_11)
+    set_target_properties(wlh_host_sim_repl_json_tests PROPERTIES
+        C_EXTENSIONS OFF)
+    if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
+        target_compile_options(wlh_host_sim_repl_json_tests PRIVATE
+            -Wall -Werror -UNDEBUG)
+    elseif(MSVC)
+        target_compile_options(wlh_host_sim_repl_json_tests PRIVATE /UNDEBUG)
+    endif()
+    add_test(NAME wlh_host_sim_repl_json COMMAND wlh_host_sim_repl_json_tests)
 
 endif()

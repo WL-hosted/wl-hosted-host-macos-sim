@@ -25,6 +25,10 @@ wl-hosted-host-macos-sim -> wl-hosted-core/host-core
   `wlh_posix_osal` 之上，不额外引入直接的 pthread 依赖。
 - `third_party/mbedtls`：Mbed-TLS 3.6.6，仅用于 NimBLE Security Manager 的
   AES-CMAC / ECDH（LE Secure Connections）加密原语。
+- `third_party/linenoise`：antirez/linenoise（BSD-2），REPL 场景的行编辑/
+  历史；非 TTY（管道）输入时自动退化为普通行读取。
+- `third_party/cJSON`：DaveGamble/cJSON（MIT），REPL 场景的 JSON Lines
+  输出构建与转义。
 本仓库的角色固定为 `HOST_SIM`。当通过 `--ipc` 直接连接对端（Manager 或 Coproc Sim）时，会自动启用 sideband 运行时/故障注入通道；当通过 `--usb` 连接真实 Coprocessor 时，只传输标准 WL-hosted wire 帧，sideband 关闭。
 
 ## 2. 构建要求
@@ -37,10 +41,12 @@ wl-hosted-host-macos-sim -> wl-hosted-core/host-core
 - Apache NimBLE 1.10.0、Mbed-TLS 3.6.6
   （分别固定于 `third_party/mynewt-nimble`、`third_party/mbedtls` 子模块；
   BLE 场景必需）
+- linenoise、cJSON（分别固定于 `third_party/linenoise`、`third_party/cJSON`
+  子模块；REPL 场景必需）
 
 许可证：NimBLE 为 Apache-2.0，Mbed-TLS 为 Apache-2.0 / GPL-2.0
-双许可（本项目按 Apache-2.0 使用）。各自完整声明见对应子模块目录下的
-`LICENSE` 文件。
+双许可（本项目按 Apache-2.0 使用），linenoise 为 BSD-2-Clause，cJSON 为
+MIT。各自完整声明见对应子模块目录下的 `LICENSE` 文件。
 
 安装 libusb：
 
@@ -125,9 +131,9 @@ ctest --test-dir build-asan --output-on-failure
 --usb VID:PID
     指定 USB 后端 VID:PID（十六进制）。与 --ipc 二选一。
 
---scenario smoke|scan|connect|recovery|services|managed|ble-central|ble-peripheral|ble-coexistence
+--scenario smoke|scan|connect|recovery|services|managed|ota|repl|ble-central|ble-peripheral|ble-coexistence
     指定运行场景，默认 connect。managed 仅适用于 IPC 模式；ble-* 仅适用于
-    USB 模式（HCI 通道不经 IPC 承载）。
+    USB 模式（HCI 通道不经 IPC 承载）；repl 两种模式均可用。
 
 --monitor-interval-ms N
     设置 sideband 运行时信息上报间隔，单位毫秒，默认 1000。
@@ -166,7 +172,7 @@ ctest --test-dir build-asan --output-on-failure
 
 ## 6. 内置场景说明
 
-所有场景都会先等待 Host Core 进入 `READY` 状态（Hello 协商完成）。
+除 `managed` 与 `repl` 自行管理 READY 等待外，其余场景都会先等待 Host Core 进入 `READY` 状态（Hello 协商完成）。
 
 | 场景 | 行为 |
 |------|------|
@@ -176,9 +182,55 @@ ctest --test-dir build-asan --output-on-failure
 | `connect` | 在 `scan` 的基础上，使用 `--ssid`/`--credential` 连接指定 AP，等待 `WLH_HOST_EVENT_WIFI_CONNECTED`，发送 Ethernet echo 帧并等待 `WLH_HOST_EVENT_ETHERNET_STA_RX`，最后断开并等待 `WLH_HOST_EVENT_WIFI_DISCONNECTED`。 |
 | `services` | 调用 Device Information 服务获取厂商/板级/UID 信息，并发送一条 User Passthrough 消息等待 completion；还会短暂等待可选的 `USER_MESSAGE_RESULT` 事件。 |
 | `managed` | Manager 驱动模式：等待 READY 后自动执行一次 Wi-Fi INITIALIZE（对端已初始化时容忍失败），随后长期驻留，通过 sideband 接收 Manager 下发的 `SIM_RECORD_WIFI_COMMAND`（scan / connect / disconnect / start_ap / stop_ap）并转换为标准 Wi-Fi RPC；也可接收 `SIM_RECORD_PING_COMMAND`，由 `NO_SYS=0` lwIP 通过 STA Ethernet 数据面完成 DHCP、DNS 和 ICMP ping 并返回 `SIM_RECORD_PING_RESULT`。链路断开后自动重新等待 READY 并重新 INITIALIZE，直到收到退出信号。仅 IPC + sideband 模式有效；USB `--usb` 独立运行模式行为不变。 |
+| `repl` | 交互式 REPL：从 stdin 逐行读取命令，stdout 输出 JSON Lines（详见 §6.1）。IPC 与 USB 模式均可用；每条命令自行等待 READY，链路断开时 REPL 存活，异步 state 事件反映恢复过程。 |
 | `ble-central` | 仅 USB。启动 NimBLE Host（GET_INFO → INITIALIZE(HCI) → ENABLE(LE) → NPL/pools → host task → sync），扫描（或直连 `--ble-peer-address`）测试对端，建立连接并发起 LE Secure Connections 配对，发现测试服务/特征/CCCD，订阅通知，写入 `ping`，验证收到 `pong` 通知并读取校验为 `pong`，最后断开。第二次运行会复用已持久化的 bond 直接加密，无需重新配对。 |
 | `ble-peripheral` | 仅 USB。以测试服务广播为 peripheral，接受中心设备连接与配对，处理 `ping`/`pong` GATT 事务并发送通知；对端断开后继续广播，等待下一次连接。 |
 | `ble-coexistence` | 仅 USB。先完成 WPA2 连接与 DHCP，并启动对 `one.one.one.one` 的持续 DNS/ICMP 健康检查；在 Wi-Fi 保持连接的同时执行完整的 ble-central 事务；BLE 结束后 Wi-Fi 仍须在线且再完成 ≥10 次 ping，验证 BLE 与 Wi-Fi 数据面并发共存。 |
+
+### 6.1 REPL JSON Lines 契约
+
+`--scenario repl` 从 stdin 逐行读取命令，stdout 只输出 JSON Lines：每行一个
+JSON 对象，固定携带 `"source":"wlh-host-sim"` 与 `"event"` 字段；日志全部走
+stderr，stdout 可直接接管道逐行 `json.loads`。TTY 下由 linenoise 提供
+`wlh> ` 提示符、行编辑与历史（上箭头），Ctrl-C/Ctrl-D 干净退出；管道（非
+TTY）输入时无提示符，读到 EOF 后自然退出。
+
+命令（参数含空格时用双引号包裹；`user-message` 取命令名后的原始剩余文本）：
+
+| 命令 | 模式 | 说明 |
+|------|------|------|
+| `scan [ssid]` | 两者 | 惰性执行 Wi-Fi INITIALIZE 后扫描；每个网络输出一行 `scan_result` 事件。 |
+| `connect <ssid> [credential]` | 两者 | 连接 AP；无凭据按 Open，有凭据按 WPA2-PSK。 |
+| `disconnect` | 两者 | 断开当前 AP。 |
+| `status` | 两者 | 输出 Host 状态、session、帧计数、连接状态与运行时长。 |
+| `device-info` | 两者 | 查询 Device Information 服务（UID 以十六进制输出）。 |
+| `user-message <text>` | 两者 | 发送 User Passthrough 消息；可选 RESULT 事件另行输出。 |
+| `eth-echo` | 仅 IPC | 发送测试 Ethernet 帧并等待 mock coprocessor 回环。 |
+| `ping <host> [count] [timeout_ms]` | 两者 | 经 lwIP STA 数据面执行 DNS + ICMP ping（count 1-10，默认 1；超时默认 2000ms）。 |
+| `ble central\|peripheral` | 仅 USB | 同步运行完整 BLE 场景（阻塞至结束），选项沿用 `--ble-*` 参数。 |
+| `help` / `quit` / `exit` | 两者 | 列出命令 / 退出。 |
+
+事件流：命令结束输出 `{"event":"result","command":"…","result":N}`（N 为
+`wlh_host_result_t` 数值，0 为成功）；失败前先输出 `error` 事件，携带
+`result`、`status_domain`/`status_code` 或 `detail`。异步事件（`state`、
+`scan_result`、`scan_complete`、`wifi_connected`、`wifi_disconnected`、
+`user_message_result`、`bluetooth_state`、`ping_result`、`protocol_fault`）
+随时可能插入。会话以 `repl_ready` 开始、`repl_exit`（reason 为
+`quit|eof|signal|transport`）结束。不适用当前传输模式的命令返回
+`NOT_SUPPORTED (-11)` 的 error 行。
+
+SSID/payload 为任意字节串：合法 UTF-8 原样输出；否则字段内容替换为可打印
+形式，并附加 `<key>_hex` 字段携带原始字节的十六进制。
+
+管道驱动示例：
+
+```sh
+printf 'scan\nconnect WPA2Net password123\neth-echo\nping one.one.one.one\ndisconnect\nquit\n' \
+  | ./build-debug/wlh-host-macos-sim --ipc connect:/tmp/host.sock --scenario repl 2>/dev/null
+```
+
+已知限制：TTY 交互中异步事件行可能与正在编辑的行交错；管道驱动的自动化场景
+无此问题。
 
 ## 7. 架构与线程模型
 
@@ -260,6 +312,7 @@ bond 存储）并整体重启。
 
 - `wlh_host_sim_ipc`：`tests/test_ipc.c` 使用 `socketpair` 验证 IPC hello 握手、record 读写、角色与 sideband 标志解析。
 - `wlh_host_sim_npl`：`tests/test_npl.c` 验证 NimBLE Porting Layer over `wlh_posix_osal` 的行为：event 队列 FIFO 顺序、callout 取消/重排、单次定时器到期、semaphore pend 超时、阻塞消费者唤醒（停止路径）、反复 start/stop 循环、毫秒/tick 换算。
+- `wlh_host_sim_repl_json`：`tests/test_repl_json.c` 验证 REPL 的 JSON Lines 输出层：敌意字节串（引号/反斜杠/控制符/非法 UTF-8/内嵌 NUL）产出的每行都必须是合法 JSON，非法 UTF-8 必须附带 `_hex` 回退字段。
 
 运行：
 
@@ -287,7 +340,8 @@ ctest --test-dir build-debug --output-on-failure
 
 - `.gitmodules`
 - 各子模块 gitlink（`core/`、`third_party/lwip`、`third_party/easylogger`、
-  `third_party/mynewt-nimble`、`third_party/mbedtls`）
+  `third_party/mynewt-nimble`、`third_party/mbedtls`、`third_party/linenoise`、
+  `third_party/cJSON`）
 - `SUBMODULE.lock`
 
 更新子模块后应同步 `SUBMODULE.lock` 中的完整 40 字符 commit SHA，并确保每个

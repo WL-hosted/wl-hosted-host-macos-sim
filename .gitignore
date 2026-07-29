@@ -1,6 +1,1 @@
-/build/
-/build-asan/
-/build-refactor/
-/build-debug/
-/build-release/
-/build-ota/
+build*/

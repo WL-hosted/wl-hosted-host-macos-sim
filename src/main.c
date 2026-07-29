@@ -1,4 +1,6 @@
+#include "app.h"
 #include "network.h"
+#include "repl.h"
 #include "sim.h"
 #include "transport_usb.h"
 #include "wlh/log.h"
@@ -22,62 +24,6 @@
 
 #include "ble/ble_app.h"
 #include "ble/hci_transport.h"
-
-typedef struct app {
-    sim_ipc_t ipc;
-    sim_executor_t executor;
-    sim_executor_t tx_executor;
-    wlh_posix_osal_t osal;
-    wlh_host_t host;
-    sim_network_t *network;
-
-    bool use_usb;
-    sim_usb_config_t usb_config;
-    sim_usb_transport_t *usb;
-    const char *ssid;
-    const char *credential;
-    const char *ota_image;
-    const char *ota_version;
-    uint32_t ota_timeout_ms;
-    uint64_t ota_image_size;
-
-    pthread_t rx_thread;
-    pthread_mutex_t state_mutex;
-    pthread_cond_t state_changed;
-
-    atomic_bool running;
-    atomic_uint fail_allocations;
-    unsigned completions;
-    wlh_host_result_t last_completion_result;
-    bool ota_begin_done;
-    wlh_host_ota_begin_response_t ota_begin;
-    bool ota_query_done;
-    wlh_host_ota_query_response_t ota_query;
-    unsigned ota_credit_events;
-    unsigned ota_credit_seen;
-    bool ota_activate_done;
-    wlh_host_result_t ota_activate_result;
-    bool ota_left_ready;
-    bool scan_complete;
-    bool connected;
-    bool disconnected;
-    bool ethernet_rx;
-    bool device_info_done;
-    wlh_host_result_t device_info_result;
-    bool user_result_received;
-
-    uint64_t started_ms;
-    uint32_t monitor_interval_ms;
-
-    wlh_osal_ops_t osal_ops;
-    wlh_ble_options_t ble;
-    pthread_t ping_thread;
-    bool ping_thread_started;
-    atomic_bool ping_worker_running;
-    unsigned ping_results;
-    unsigned ping_ok;
-    unsigned ping_target;
-} app_t;
 
 typedef struct tx_work {
     app_t *app;
@@ -104,7 +50,7 @@ static int send_protobuf(
     size_t maximum
 );
 
-static uint64_t monotonic_ms(void) {
+uint64_t wlh_app_monotonic_ms(void) {
     struct timespec value;
     clock_gettime(CLOCK_MONOTONIC, &value);
     return (uint64_t)value.tv_sec * 1000u + (uint64_t)value.tv_nsec / 1000000u;
@@ -348,7 +294,7 @@ static void usb_on_lost(void *context) {
     wlh_host_transport_lost(&app->host);
 }
 
-static const char *wifi_security_name(wlh_protocol_v1_WifiSecurity security) {
+const char *wlh_app_wifi_security_name(wlh_protocol_v1_WifiSecurity security) {
     switch (security) {
     case wlh_protocol_v1_WifiSecurity_WIFI_SECURITY_OPEN:
         return "Open";
@@ -376,51 +322,61 @@ static const char *wifi_security_name(wlh_protocol_v1_WifiSecurity security) {
     }
 }
 
-static void log_scan_results(const wlh_host_event_t *event) {
+int wlh_app_for_each_scan_network(
+    const wlh_host_event_t *event,
+    wlh_app_scan_network_fn callback,
+    void *context
+) {
     wlh_protocol_v1_WifiScanResultEvent result =
         wlh_protocol_v1_WifiScanResultEvent_init_zero;
     pb_istream_t input =
         pb_istream_from_buffer(event->payload, event->payload_size);
     pb_size_t index;
 
-    if (!pb_decode(
-            &input, wlh_protocol_v1_WifiScanResultEvent_fields, &result
-        )) {
-        WLH_LOGW("host-sim", "failed to decode Wi-Fi scan result event");
+    if (!pb_decode(&input, wlh_protocol_v1_WifiScanResultEvent_fields, &result))
+        return -1;
+    for (index = 0; index < result.networks_count; ++index)
+        callback(context, result.scan_id, &result.networks[index]);
+    return 0;
+}
+
+static void log_scan_network(
+    void *context, uint32_t scan_id, const wlh_protocol_v1_WifiNetwork *network
+) {
+    char ssid[sizeof(network->ssid.bytes) + 1u];
+    pb_size_t ssid_index;
+    (void)context;
+    for (ssid_index = 0; ssid_index < network->ssid.size; ++ssid_index) {
+        uint8_t byte = network->ssid.bytes[ssid_index];
+        ssid[ssid_index] = (byte >= 0x20u && byte <= 0x7eu) ? (char)byte : '.';
+    }
+    ssid[network->ssid.size] = '\0';
+    if (network->bssid.size != 6u) {
+        WLH_LOGW("host-sim", "scan result has invalid BSSID length");
         return;
     }
-    for (index = 0; index < result.networks_count; ++index) {
-        const wlh_protocol_v1_WifiNetwork *network = &result.networks[index];
-        char ssid[sizeof(network->ssid.bytes) + 1u];
-        pb_size_t ssid_index;
-        for (ssid_index = 0; ssid_index < network->ssid.size; ++ssid_index) {
-            uint8_t byte = network->ssid.bytes[ssid_index];
-            ssid[ssid_index] =
-                (byte >= 0x20u && byte <= 0x7eu) ? (char)byte : '.';
-        }
-        ssid[network->ssid.size] = '\0';
-        if (network->bssid.size != 6u) {
-            WLH_LOGW("host-sim", "scan result has invalid BSSID length");
-            continue;
-        }
-        WLH_LOGI(
-            "host-sim",
-            "Wi-Fi scan result scan_id=%u ssid=%s "
-            "bssid=%02x:%02x:%02x:%02x:%02x:%02x channel=%u rssi=%ld "
-            "security=%s",
-            result.scan_id,
-            ssid,
-            network->bssid.bytes[0],
-            network->bssid.bytes[1],
-            network->bssid.bytes[2],
-            network->bssid.bytes[3],
-            network->bssid.bytes[4],
-            network->bssid.bytes[5],
-            network->channel,
-            (long)network->rssi_dbm,
-            wifi_security_name(network->security)
-        );
-    }
+    WLH_LOGI(
+        "host-sim",
+        "Wi-Fi scan result scan_id=%u ssid=%s "
+        "bssid=%02x:%02x:%02x:%02x:%02x:%02x channel=%u rssi=%ld "
+        "security=%s",
+        scan_id,
+        ssid,
+        network->bssid.bytes[0],
+        network->bssid.bytes[1],
+        network->bssid.bytes[2],
+        network->bssid.bytes[3],
+        network->bssid.bytes[4],
+        network->bssid.bytes[5],
+        network->channel,
+        (long)network->rssi_dbm,
+        wlh_app_wifi_security_name(network->security)
+    );
+}
+
+static void log_scan_results(const wlh_host_event_t *event) {
+    if (wlh_app_for_each_scan_network(event, log_scan_network, NULL) != 0)
+        WLH_LOGW("host-sim", "failed to decode Wi-Fi scan result event");
 }
 
 static void host_event(void *context, const wlh_host_event_t *event) {
@@ -506,6 +462,7 @@ static void host_event(void *context, const wlh_host_event_t *event) {
         event->method_id,
         event->payload_size
     );
+    wlh_repl_on_host_event(app, event);
 }
 
 static int network_send(void *context, const uint8_t *frame, size_t size) {
@@ -520,6 +477,8 @@ static void network_ping_result(
 ) {
     app_t *app = context;
     wlh_sim_v1_SimPingResult message = wlh_sim_v1_SimPingResult_init_zero;
+    if (wlh_repl_on_ping_result(app, result))
+        return;
     pthread_mutex_lock(&app->state_mutex);
     app->ping_results++;
     if (result->success)
@@ -630,7 +589,7 @@ static void send_runtime(app_t *app) {
             ? wlh_sim_v1_SimLinkState_SIM_LINK_STATE_RECOVERING
             : wlh_sim_v1_SimLinkState_SIM_LINK_STATE_NEGOTIATING;
     runtime.session_id = diagnostics.session_id;
-    runtime.uptime_ms = monotonic_ms() - app->started_ms;
+    runtime.uptime_ms = wlh_app_monotonic_ms() - app->started_ms;
     runtime.tx_frames = diagnostics.tx_frames;
     runtime.rx_frames = diagnostics.rx_frames;
     runtime.dropped_frames = diagnostics.checksum_errors;
@@ -873,23 +832,27 @@ static void *rx_main(void *context) {
     return NULL;
 }
 
-static struct timespec relative_duration_ms(uint64_t duration_ms) {
+struct timespec wlh_app_relative_duration_ms(uint64_t duration_ms) {
     struct timespec duration;
     duration.tv_sec = (time_t)(duration_ms / 1000u);
     duration.tv_nsec = (long)(duration_ms % 1000u) * 1000000L;
     return duration;
 }
 
-static bool wait_until(
+bool wlh_app_interrupted(void) {
+    return atomic_load(&interrupted);
+}
+
+bool wlh_app_wait_until(
     app_t *app, bool (*predicate)(app_t *), uint32_t timeout_ms
 ) {
-    uint64_t deadline = monotonic_ms() + timeout_ms;
+    uint64_t deadline = wlh_app_monotonic_ms() + timeout_ms;
     uint64_t next_monitor = 0u;
     bool done = false;
 
     pthread_mutex_lock(&app->state_mutex);
     while (atomic_load(&app->running) && !atomic_load(&interrupted)) {
-        uint64_t now = monotonic_ms();
+        uint64_t now = wlh_app_monotonic_ms();
         uint64_t wake_at;
         struct timespec native_duration;
         done = predicate(app);
@@ -898,14 +861,14 @@ static bool wait_until(
         if (now >= next_monitor) {
             pthread_mutex_unlock(&app->state_mutex);
             send_runtime(app);
-            now = monotonic_ms();
+            now = wlh_app_monotonic_ms();
             next_monitor = now + app->monitor_interval_ms;
             pthread_mutex_lock(&app->state_mutex);
         }
         wake_at = deadline < next_monitor ? deadline : next_monitor;
-        now = monotonic_ms();
+        now = wlh_app_monotonic_ms();
         native_duration =
-            relative_duration_ms(wake_at > now ? wake_at - now : 0u);
+            wlh_app_relative_duration_ms(wake_at > now ? wake_at - now : 0u);
         (void)pthread_cond_timedwait_relative_np(
             &app->state_changed, &app->state_mutex, &native_duration
         );
@@ -946,14 +909,14 @@ static bool user_result_arrived(app_t *app) {
 
 static int run_managed(app_t *app) {
     while (atomic_load(&app->running) && !atomic_load(&interrupted)) {
-        if (!wait_until(app, ready, 30000u))
+        if (!wlh_app_wait_until(app, ready, 30000u))
             break;
         app->completions = 0u;
         (void)wlh_host_wifi_initialize(&app->host, completion, app);
         /* Repeat INITIALIZE is idempotent; tolerate a missing completion. */
-        if (!wait_until(app, one_completion, 3000u))
+        if (!wlh_app_wait_until(app, one_completion, 3000u))
             WLH_LOGW("host-sim", "managed initialize not confirmed");
-        (void)wait_until(app, not_ready, UINT32_MAX);
+        (void)wlh_app_wait_until(app, not_ready, UINT32_MAX);
     }
     return atomic_load(&app->running) && !atomic_load(&interrupted) ? -1 : 0;
 }
@@ -980,7 +943,7 @@ static void *ping_worker(void *context) {
         pthread_mutex_lock(&app->state_mutex);
         while (atomic_load(&app->ping_worker_running) &&
                app->ping_results == before) {
-            struct timespec duration = relative_duration_ms(3000u);
+            struct timespec duration = wlh_app_relative_duration_ms(3000u);
             if (pthread_cond_timedwait_relative_np(
                     &app->state_changed, &app->state_mutex, &duration
                 ) != 0)
@@ -1007,10 +970,10 @@ static int coexistence_wifi_up(app_t *app) {
 
     app->completions = 0u;
     (void)wlh_host_wifi_initialize(&app->host, completion, app);
-    if (!wait_until(app, one_completion, 3000u))
+    if (!wlh_app_wait_until(app, one_completion, 3000u))
         return -1;
     (void)wlh_host_wifi_connect(&app->host, &connect, completion, app);
-    if (!wait_until(app, connected, 20000u)) {
+    if (!wlh_app_wait_until(app, connected, 20000u)) {
         WLH_LOGE("host-sim", "coexistence: Wi-Fi connect failed");
         return -1;
     }
@@ -1022,7 +985,7 @@ static int coexistence_wifi_up(app_t *app) {
     pthread_mutex_lock(&app->state_mutex);
     app->ping_target = 1u;
     pthread_mutex_unlock(&app->state_mutex);
-    if (!wait_until(app, ping_target_reached, 30000u)) {
+    if (!wlh_app_wait_until(app, ping_target_reached, 30000u)) {
         WLH_LOGE("host-sim", "coexistence: DHCP/DNS/ICMP health check failed");
         return -1;
     }
@@ -1034,7 +997,7 @@ static int run_ble_scenario(app_t *app, const char *scenario) {
     bool coexist = strcmp(scenario, "ble-coexistence") == 0;
     int result = 0;
 
-    if (!wait_until(app, ready, 5000u))
+    if (!wlh_app_wait_until(app, ready, 5000u))
         return -1;
 
     if (coexist && coexistence_wifi_up(app) != 0)
@@ -1058,7 +1021,8 @@ static int run_ble_scenario(app_t *app, const char *scenario) {
             }
             app->ping_target = app->ping_ok + 10u;
             pthread_mutex_unlock(&app->state_mutex);
-            if (result == 0 && !wait_until(app, ping_target_reached, 60000u)) {
+            if (result == 0 &&
+                !wlh_app_wait_until(app, ping_target_reached, 60000u)) {
                 WLH_LOGE(
                     "host-sim", "coexistence: post-BLE ping quota not met"
                 );
@@ -1077,7 +1041,7 @@ static int run_ble_scenario(app_t *app, const char *scenario) {
         app->disconnected = false;
         pthread_mutex_unlock(&app->state_mutex);
         (void)wlh_host_wifi_disconnect(&app->host, completion, app);
-        (void)wait_until(app, disconnected, 3000u);
+        (void)wlh_app_wait_until(app, disconnected, 3000u);
     }
     return result;
 }
@@ -1127,23 +1091,23 @@ static int run_ota_scenario(app_t *app) {
     params.target_version = app->ota_version;
     CC_SHA256(image, (CC_LONG)file_size, params.sha256);
     app->ota_query_done = false;
-    if (!wait_until(app, ready, 10000u) ||
+    if (!wlh_app_wait_until(app, ready, 10000u) ||
         wlh_host_ota_query(&app->host, ota_query_completion, app) !=
             WLH_HOST_OK ||
-        !wait_until(app, ota_query_done, 5000u))
+        !wlh_app_wait_until(app, ota_query_done, 5000u))
         goto fail;
     if (app->ota_query.transfer_id != 0u) {
         app->completions = 0u;
         if (wlh_host_ota_abort(
                 &app->host, app->ota_query.transfer_id, completion, app
             ) != WLH_HOST_OK ||
-            !wait_until(app, one_completion, 5000u))
+            !wlh_app_wait_until(app, one_completion, 5000u))
             goto fail;
     }
     app->ota_begin_done = false;
     if (wlh_host_ota_begin(&app->host, &params, ota_begin_completion, app) !=
             WLH_HOST_OK ||
-        !wait_until(app, ota_begin_done, timeout) ||
+        !wlh_app_wait_until(app, ota_begin_done, timeout) ||
         app->last_completion_result != WLH_HOST_OK)
         goto fail;
     while (offset < (size_t)file_size) {
@@ -1165,7 +1129,7 @@ static int run_ota_scenario(app_t *app) {
                 pthread_mutex_lock(&app->state_mutex);
                 app->ota_credit_seen = app->ota_credit_events;
                 pthread_mutex_unlock(&app->state_mutex);
-                if (!wait_until(app, ota_credit_available, 10000u))
+                if (!wlh_app_wait_until(app, ota_credit_available, 10000u))
                     goto fail;
             }
         } while (result == WLH_HOST_NO_CREDIT && !interrupted);
@@ -1177,7 +1141,7 @@ static int run_ota_scenario(app_t *app) {
     if (wlh_host_ota_finalize(
             &app->host, app->ota_begin.transfer_id, offset, completion, app
         ) != WLH_HOST_OK ||
-        !wait_until(app, one_completion, timeout))
+        !wlh_app_wait_until(app, one_completion, timeout))
         goto fail;
     app->ota_activate_done = false;
     app->ota_left_ready = false;
@@ -1188,16 +1152,17 @@ static int run_ota_scenario(app_t *app) {
             ota_activate_completion,
             app
         ) != WLH_HOST_OK ||
-        !wait_until(app, ota_activate_finished_or_rebooting, 10000u))
+        !wlh_app_wait_until(app, ota_activate_finished_or_rebooting, 10000u))
         goto fail;
     if (app->ota_activate_done && app->ota_activate_result != WLH_HOST_OK)
         goto fail;
-    if (!wait_until(app, not_ready, 10000u) || !wait_until(app, ready, timeout))
+    if (!wlh_app_wait_until(app, not_ready, 10000u) ||
+        !wlh_app_wait_until(app, ready, timeout))
         goto fail;
     app->ota_query_done = false;
     if (wlh_host_ota_query(&app->host, ota_query_completion, app) !=
             WLH_HOST_OK ||
-        !wait_until(app, ota_query_done, 5000u) ||
+        !wlh_app_wait_until(app, ota_query_done, 5000u) ||
         app->last_completion_result != WLH_HOST_OK ||
         app->ota_query.transfer_id != 0u)
         goto fail;
@@ -1239,6 +1204,10 @@ static int run_scenario(app_t *app, const char *scenario) {
     if (strcmp(scenario, "managed") == 0)
         return run_managed(app);
 
+    /* The REPL performs its own READY handling per command. */
+    if (strcmp(scenario, "repl") == 0)
+        return wlh_repl_run(app);
+
     if (strncmp(scenario, "ble-", 4u) == 0) {
         if (!app->use_usb) {
             WLH_LOGE(
@@ -1254,19 +1223,19 @@ static int run_scenario(app_t *app, const char *scenario) {
     if (strcmp(scenario, "ota") == 0)
         return run_ota_scenario(app);
 
-    if (!wait_until(app, ready, 5000u))
+    if (!wlh_app_wait_until(app, ready, 5000u))
         return -1;
     if (strcmp(scenario, "smoke") == 0)
         return 0;
     if (strcmp(scenario, "recovery") == 0) {
         wlh_host_transport_lost(&app->host);
-        if (!wait_until(app, not_ready, 2000u))
+        if (!wlh_app_wait_until(app, not_ready, 2000u))
             return -1;
-        return wait_until(app, ready, 5000u) ? 0 : -1;
+        return wlh_app_wait_until(app, ready, 5000u) ? 0 : -1;
     }
     if (strcmp(scenario, "services") == 0) {
         (void)wlh_host_get_device_info(&app->host, device_info_completion, app);
-        if (!wait_until(app, device_info_ready, 3000u))
+        if (!wlh_app_wait_until(app, device_info_ready, 3000u))
             return -1;
         if (app->device_info_result != WLH_HOST_OK)
             return -1;
@@ -1281,26 +1250,26 @@ static int run_scenario(app_t *app, const char *scenario) {
             completion,
             app
         );
-        if (!wait_until(app, one_completion, 3000u))
+        if (!wlh_app_wait_until(app, one_completion, 3000u))
             return -1;
         /* A RESULT event is optional; give it a short window. */
-        (void)wait_until(app, user_result_arrived, 1500u);
+        (void)wlh_app_wait_until(app, user_result_arrived, 1500u);
         return 0;
     }
 
     app->completions = 0u;
     (void)wlh_host_wifi_initialize(&app->host, completion, app);
-    if (!wait_until(app, one_completion, 3000u))
+    if (!wlh_app_wait_until(app, one_completion, 3000u))
         return -1;
 
     (void)wlh_host_wifi_scan(&app->host, &scan, completion, app);
-    if (!wait_until(app, scan_complete, 3000u))
+    if (!wlh_app_wait_until(app, scan_complete, 3000u))
         return -1;
     if (strcmp(scenario, "scan") == 0)
         return 0;
 
     (void)wlh_host_wifi_connect(&app->host, &connect, completion, app);
-    if (!wait_until(app, connected, 4000u))
+    if (!wlh_app_wait_until(app, connected, 4000u))
         return -1;
 
     /* Ethernet echo is a mock-coprocessor behavior; a real device forwards
@@ -1309,19 +1278,19 @@ static int run_scenario(app_t *app, const char *scenario) {
         (void)wlh_host_ethernet_sta_send(
             &app->host, ethernet, sizeof(ethernet)
         );
-        if (!wait_until(app, ethernet_rx, 3000u))
+        if (!wlh_app_wait_until(app, ethernet_rx, 3000u))
             return -1;
     }
 
     (void)wlh_host_wifi_disconnect(&app->host, completion, app);
-    return wait_until(app, disconnected, 3000u) ? 0 : -1;
+    return wlh_app_wait_until(app, disconnected, 3000u) ? 0 : -1;
 }
 
 static void usage(const char *program) {
     fprintf(
         stderr,
         "usage: %s --ipc connect:PATH|fd:N | --usb VID:PID [--scenario "
-        "smoke|scan|connect|recovery|services|managed|ota|ble-central|"
+        "smoke|scan|connect|recovery|services|managed|ota|repl|ble-central|"
         "ble-peripheral|ble-coexistence] "
         "[--monitor-interval-ms N] [--rpc-timeout-ms N] "
         "[--ssid SSID] [--credential CREDENTIAL] "
@@ -1444,6 +1413,9 @@ int main(int argc, char **argv) {
         usage(argv[0]);
         return 2;
     }
+    /* Arm the REPL before wlh_host_start so the first READY state change is
+     * already emitted as a JSON event line. */
+    app.repl.active = strcmp(scenario, "repl") == 0;
 
     signal(SIGINT, signal_handler);
     signal(SIGTERM, signal_handler);
@@ -1509,7 +1481,7 @@ int main(int argc, char **argv) {
         WLH_LOGE("host-sim", "lwIP initialization failed");
         return 1;
     }
-    app.started_ms = monotonic_ms();
+    app.started_ms = wlh_app_monotonic_ms();
     atomic_store(&app.running, true);
 
     if (!app.use_usb &&

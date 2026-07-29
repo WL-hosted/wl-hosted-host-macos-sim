@@ -1,7 +1,11 @@
 core.url=https://github.com/WL-hosted/wl-hosted-core.git
 core.commit=bf7cdc9a06efe96dd0a48da534c6ce022db9e396
+cJSON.url=https://github.com/DaveGamble/cJSON.git
+cJSON.commit=c859b25da02955fef659d658b8f324b5cde87be3
 easylogger.url=https://github.com/armink/EasyLogger.git
 easylogger.commit=a596b2642e27af3a2dbdeb0e5f04a6b5b673ef24
+linenoise.url=https://github.com/antirez/linenoise.git
+linenoise.commit=a473823d74b93eab2ba83480df16ed37617493f2
 lwip.url=https://github.com/lwip-tcpip/lwip.git
 lwip.commit=77dcd25a72509eb83f72b033d219b1d40cd8eb95
 mbedtls.url=https://github.com/Mbed-TLS/mbedtls.git
