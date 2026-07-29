@@ -40,6 +40,8 @@ typedef struct app_repl {
     sim_ping_result_t ping_result;
 } app_repl_t;
 
+typedef struct wlh_iperf_controller wlh_iperf_controller_t;
+
 typedef struct app {
     sim_ipc_t ipc;
     sim_executor_t executor;
@@ -96,6 +98,7 @@ typedef struct app {
     unsigned ping_target;
 
     app_repl_t repl;
+    wlh_iperf_controller_t *iperf;
 } app_t;
 
 uint64_t wlh_app_monotonic_ms(void);

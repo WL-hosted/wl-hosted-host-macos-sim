@@ -7,6 +7,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
+/* Returns 0 when accepted, a positive value for transient backpressure, and
+ * a negative value for a permanent link error. */
 typedef int (*sim_network_send_fn)(
     void *context, const uint8_t *frame, size_t size
 );
@@ -46,5 +48,7 @@ int sim_network_ping(
     uint32_t count,
     uint32_t timeout_ms
 );
+/* Returns true only when the Ethernet netif is up and DHCP assigned IPv4. */
+bool sim_network_ipv4(sim_network_t *network, char address[16]);
 
 #endif

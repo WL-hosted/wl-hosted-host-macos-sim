@@ -41,6 +41,11 @@ add_library(wlh_host_sim_lwip STATIC
     ${lwipcore_SRCS}
     ${lwipcore4_SRCS}
     "${LWIP_DIR}/src/api/tcpip.c"
+    "${LWIP_DIR}/src/api/api_lib.c"
+    "${LWIP_DIR}/src/api/api_msg.c"
+    "${LWIP_DIR}/src/api/err.c"
+    "${LWIP_DIR}/src/api/netbuf.c"
+    "${LWIP_DIR}/src/api/sockets.c"
     "${LWIP_DIR}/src/netif/ethernet.c"
     src/lwip_port/sys_arch.c)
 target_include_directories(wlh_host_sim_lwip
@@ -51,7 +56,8 @@ target_compile_features(wlh_host_sim_lwip PUBLIC c_std_11)
 target_link_libraries(wlh_host_sim_lwip PUBLIC wlh::osal Threads::Threads)
 
 add_library(wlh_host_sim_platform STATIC
-    src/ipc.c src/executor.c src/transport_usb.c src/network.c)
+    src/ipc.c src/executor.c src/transport_usb.c src/network.c
+    src/iperf2.c)
 target_include_directories(wlh_host_sim_platform
     PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_compile_features(wlh_host_sim_platform PUBLIC c_std_11)
@@ -145,7 +151,8 @@ if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
     target_compile_options(wlh_cjson PRIVATE -w)
 endif()
 
-add_executable(wlh-host-macos-sim src/main.c src/repl.c src/repl_json.c)
+add_executable(wlh-host-macos-sim
+    src/main.c src/repl.c src/repl_json.c src/iperf_controller.c)
 target_compile_features(wlh-host-macos-sim PRIVATE c_std_11)
 target_compile_definitions(wlh-host-macos-sim PRIVATE WLH_ENABLE_TEST_HOOKS)
 target_link_libraries(wlh-host-macos-sim PRIVATE
@@ -163,6 +170,15 @@ foreach(target wlh_host_sim_lwip wlh_host_sim_platform wlh-host-macos-sim)
 endforeach()
 
 if(WLH_SIM_BUILD_TESTING)
+    add_executable(wlh_host_sim_iperf2_tests tests/test_iperf2.c src/iperf2.c)
+    target_include_directories(wlh_host_sim_iperf2_tests PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/src")
+    target_compile_features(wlh_host_sim_iperf2_tests PRIVATE c_std_11)
+    if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
+        target_compile_options(wlh_host_sim_iperf2_tests PRIVATE -Wall -Werror -UNDEBUG)
+    endif()
+    add_test(NAME wlh_host_sim_iperf2 COMMAND wlh_host_sim_iperf2_tests)
+
     add_executable(wlh_host_sim_ipc_tests tests/test_ipc.c)
     target_link_libraries(wlh_host_sim_ipc_tests PRIVATE wlh_host_sim_platform Threads::Threads)
     target_compile_features(wlh_host_sim_ipc_tests PRIVATE c_std_11)

@@ -1,5 +1,7 @@
 #include "repl.h"
 
+#include "iperf_controller.h"
+#include "network.h"
 #include "repl_json.h"
 
 #include "linenoise.h"
@@ -7,6 +9,7 @@
 #include "wlh/log.h"
 
 #include <errno.h>
+#include <limits.h>
 #include <pthread.h>
 #include <signal.h>
 #include <stdio.h>
@@ -236,9 +239,17 @@ static int cmd_scan(app_t *app, int argc, char **argv, bool *quit) {
 
 static int cmd_connect(app_t *app, int argc, char **argv, bool *quit) {
     wlh_wifi_connect_params_t params;
-    wlh_host_result_t result = ensure_wifi_initialized(app, argv[0]);
+    wlh_host_result_t result;
     bool now_connected;
     (void)quit;
+    /* An already-associated coprocessor can re-synchronize WIFI_CONNECTED
+     * while WIFI_INITIALIZE is completing. Clear the previous session state
+     * first so that event remains observable by this connect command. */
+    pthread_mutex_lock(&app->state_mutex);
+    app->connected = false;
+    app->disconnected = false;
+    pthread_mutex_unlock(&app->state_mutex);
+    result = ensure_wifi_initialized(app, argv[0]);
     if (result != WLH_HOST_OK)
         return result;
     memset(&params, 0, sizeof(params));
@@ -252,10 +263,6 @@ static int cmd_connect(app_t *app, int argc, char **argv, bool *quit) {
         params.security = 1u; /* Open */
     }
     params.timeout_ms = 10000u;
-    pthread_mutex_lock(&app->state_mutex);
-    app->connected = false;
-    app->disconnected = false;
-    pthread_mutex_unlock(&app->state_mutex);
     begin_op(app);
     result = finish_op(
         app,
@@ -331,6 +338,7 @@ static const char *state_name(wlh_host_state_t state) {
 static int cmd_status(app_t *app, int argc, char **argv, bool *quit) {
     wlh_host_diagnostics_t diagnostics;
     bool is_connected;
+    char ipv4[16] = {0};
     cJSON *doc;
     (void)argc;
     (void)argv;
@@ -347,6 +355,8 @@ static int cmd_status(app_t *app, int argc, char **argv, bool *quit) {
         cJSON_AddNumberToObject(doc, "rx_frames", diagnostics.rx_frames);
         cJSON_AddNumberToObject(doc, "pending_rpc", diagnostics.pending_rpc);
         cJSON_AddBoolToObject(doc, "wifi_connected", is_connected);
+        if (sim_network_ipv4(app->network, ipv4))
+            cJSON_AddStringToObject(doc, "dhcp_ipv4", ipv4);
         cJSON_AddStringToObject(
             doc, "peer_version", wlh_host_get_peer_version(&app->host)
         );
@@ -357,6 +367,113 @@ static int cmd_status(app_t *app, int argc, char **argv, bool *quit) {
     }
     wlh_repl_json_emit(doc);
     return WLH_HOST_OK;
+}
+
+static bool parse_u32(
+    const char *text, uint32_t minimum, uint32_t maximum, uint32_t *value
+) {
+    char *end = NULL;
+    unsigned long parsed;
+    if (text == NULL || *text == '\0')
+        return false;
+    errno = 0;
+    parsed = strtoul(text, &end, 10);
+    if (errno != 0 || end == text || *end != '\0' || parsed < minimum ||
+        parsed > maximum || parsed > UINT32_MAX)
+        return false;
+    *value = (uint32_t)parsed;
+    return true;
+}
+
+static int cmd_iperf(app_t *app, int argc, char **argv, bool *quit) {
+    wlh_iperf_request_t request;
+    wlh_host_result_t result;
+    uint32_t duration = 30u;
+    uint32_t mbps = 20u;
+    bool client;
+    (void)quit;
+    if (argc < 3 ||
+        (strcmp(argv[1], "tcp") != 0 && strcmp(argv[1], "udp") != 0) ||
+        (strcmp(argv[2], "client") != 0 && strcmp(argv[2], "server") != 0)) {
+        emit_error(
+            app,
+            argv[0],
+            WLH_HOST_INVALID_ARGUMENT,
+            "iperf tcp|udp client|server [IPv4] [duration_sec] [mbps]"
+        );
+        return WLH_HOST_INVALID_ARGUMENT;
+    }
+    client = strcmp(argv[2], "client") == 0;
+    memset(&request, 0, sizeof(request));
+    request.protocol =
+        strcmp(argv[1], "tcp") == 0 ? WLH_IPERF_TCP : WLH_IPERF_UDP;
+    request.role = client ? WLH_IPERF_CLIENT : WLH_IPERF_SERVER;
+    if (client) {
+        if (argc < 4) {
+            emit_error(
+                app,
+                argv[0],
+                WLH_HOST_INVALID_ARGUMENT,
+                "client requires IPv4 peer"
+            );
+            return WLH_HOST_INVALID_ARGUMENT;
+        }
+        request.peer = argv[3];
+        if ((argc > 4 && !parse_u32(argv[4], 1u, 300u, &duration)) ||
+            (request.protocol == WLH_IPERF_UDP && argc > 5 &&
+             !parse_u32(argv[5], 1u, 100u, &mbps)) ||
+            (request.protocol == WLH_IPERF_TCP && argc > 5)) {
+            emit_error(
+                app,
+                argv[0],
+                WLH_HOST_INVALID_ARGUMENT,
+                "invalid iPerf duration or rate"
+            );
+            return WLH_HOST_INVALID_ARGUMENT;
+        }
+    } else {
+        if ((argc > 3 && !parse_u32(argv[3], 1u, 300u, &duration)) ||
+            argc > 4) {
+            emit_error(
+                app,
+                argv[0],
+                WLH_HOST_INVALID_ARGUMENT,
+                "invalid iPerf server duration"
+            );
+            return WLH_HOST_INVALID_ARGUMENT;
+        }
+    }
+    result = require_ready(app, argv[0]);
+    if (result != WLH_HOST_OK)
+        return result;
+    pthread_mutex_lock(&app->state_mutex);
+    if (!app->connected || app->disconnected) {
+        pthread_mutex_unlock(&app->state_mutex);
+        emit_error(
+            app, argv[0], WLH_HOST_INVALID_STATE, "Wi-Fi is not connected"
+        );
+        return WLH_HOST_INVALID_STATE;
+    }
+    pthread_mutex_unlock(&app->state_mutex);
+    request.duration_sec = duration;
+    request.target_mbps = mbps;
+    switch (wlh_iperf_start(app->iperf, &request)) {
+    case 0:
+        return WLH_HOST_OK;
+    case -2:
+        emit_error(
+            app, argv[0], WLH_HOST_INVALID_STATE, "iPerf session already active"
+        );
+        return WLH_HOST_INVALID_STATE;
+    default:
+        emit_error(
+            app,
+            argv[0],
+            WLH_HOST_INVALID_STATE,
+            "DHCP IPv4 unavailable or iPerf start failed"
+        );
+        return WLH_HOST_INVALID_STATE;
+    }
 }
 
 static int cmd_device_info(app_t *app, int argc, char **argv, bool *quit) {
@@ -615,6 +732,13 @@ static const repl_command_t commands[] = {
      REPL_MODE_USB,
      cmd_ble,
      "ble central|peripheral - run the BLE scenario (blocks until done)"},
+    {"iperf",
+     2,
+     5,
+     REPL_MODE_ANY,
+     cmd_iperf,
+     "iperf tcp client <IPv4> [duration_sec] | tcp server [duration_sec] | udp "
+     "client <IPv4> [duration_sec] [mbps] | udp server [duration_sec]"},
     {"help", 0, 0, REPL_MODE_ANY, cmd_help, "help - list commands"},
     {"quit", 0, 0, REPL_MODE_ANY, cmd_quit, "quit - exit the REPL"},
     {"exit", 0, 0, REPL_MODE_ANY, cmd_quit, "exit - exit the REPL"},
@@ -868,6 +992,7 @@ int wlh_repl_run(app_t *app) {
     }
 
     atomic_store(&app->repl.reader_stop, true);
+    wlh_iperf_cancel(app->iperf, "REPL exited");
     pthread_mutex_lock(&app->state_mutex);
     pthread_cond_broadcast(&app->state_changed);
     pthread_mutex_unlock(&app->state_mutex);

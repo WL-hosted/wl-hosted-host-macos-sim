@@ -1,4 +1,5 @@
 #include "app.h"
+#include "iperf_controller.h"
 #include "network.h"
 #include "repl.h"
 #include "sim.h"
@@ -427,6 +428,8 @@ static void host_event(void *context, const wlh_host_event_t *event) {
     }
     if (link_down && app->network != NULL)
         sim_network_link_down(app->network);
+    if (link_down && app->iperf != NULL)
+        wlh_iperf_cancel(app->iperf, "Wi-Fi link disconnected");
     if (event->kind == WLH_HOST_EVENT_WIFI_SCAN_RESULT)
         log_scan_results(event);
     if (event->kind == WLH_HOST_EVENT_OTA_PROGRESS) {
@@ -453,23 +456,43 @@ static void host_event(void *context, const wlh_host_event_t *event) {
             );
         }
     }
-    WLH_LOGI(
-        "host-sim",
-        "event kind=%d state=%d service=%u method=%u bytes=%zu",
-        event->kind,
-        event->state,
-        event->service_id,
-        event->method_id,
-        event->payload_size
-    );
+    /* Ethernet payload events are a data-plane hot path. Logging every frame
+     * serializes high-rate UDP receive onto stderr; link errors still log at
+     * their source in network_send. */
+    if (event->kind != WLH_HOST_EVENT_ETHERNET_STA_RX &&
+        event->kind != WLH_HOST_EVENT_ETHERNET_AP_RX)
+        WLH_LOGI(
+            "host-sim",
+            "event kind=%d state=%d service=%u method=%u bytes=%zu",
+            event->kind,
+            event->state,
+            event->service_id,
+            event->method_id,
+            event->payload_size
+        );
     wlh_repl_on_host_event(app, event);
 }
 
 static int network_send(void *context, const uint8_t *frame, size_t size) {
     app_t *app = context;
-    return wlh_host_ethernet_sta_send(&app->host, frame, size) == WLH_HOST_OK
-               ? 0
-               : -1;
+    static uint32_t frame_count;
+    wlh_host_result_t result =
+        wlh_host_ethernet_sta_send(&app->host, frame, size);
+    ++frame_count;
+    if (frame_count <= 5u || result != WLH_HOST_OK ||
+        frame_count % 100u == 0u) {
+        WLH_LOGI(
+            "host-sim",
+            "lwIP ethernet output #%lu len=%u result=%d",
+            (unsigned long)frame_count,
+            (unsigned)size,
+            (int)result
+        );
+    }
+    if (result == WLH_HOST_OK)
+        return 0;
+    return result == WLH_HOST_NO_CREDIT || result == WLH_HOST_PENDING_FULL ? 1
+                                                                           : -1;
 }
 
 static void network_ping_result(
@@ -1481,6 +1504,12 @@ int main(int argc, char **argv) {
         WLH_LOGE("host-sim", "lwIP initialization failed");
         return 1;
     }
+    app.iperf = wlh_iperf_controller_create(&app);
+    if (app.iperf == NULL) {
+        WLH_LOGE("host-sim", "failed to create iPerf controller");
+        sim_network_destroy(app.network);
+        return 1;
+    }
     app.started_ms = wlh_app_monotonic_ms();
     atomic_store(&app.running, true);
 
@@ -1493,6 +1522,7 @@ int main(int argc, char **argv) {
         result = run_scenario(&app, scenario);
     send_runtime(&app);
 
+    wlh_iperf_controller_destroy(app.iperf);
     sim_network_destroy(app.network);
     app.network = NULL;
     (void)wlh_host_stop(&app.host);

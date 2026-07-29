@@ -42,10 +42,6 @@ u32_t sys_jiffies(void) {
     return sys_now();
 }
 
-void sys_msleep(u32_t milliseconds) {
-    osal.sleep_ms(osal.context, milliseconds);
-}
-
 err_t sys_mutex_new(sys_mutex_t *mutex) {
     if (mutex == NULL || osal.mutex_create(osal.context, &mutex->object) != 0)
         return ERR_MEM;

@@ -207,6 +207,10 @@ TTY）输入时无提示符，读到 EOF 后自然退出。
 | `user-message <text>` | 两者 | 发送 User Passthrough 消息；可选 RESULT 事件另行输出。 |
 | `eth-echo` | 仅 IPC | 发送测试 Ethernet 帧并等待 mock coprocessor 回环。 |
 | `ping <host> [count] [timeout_ms]` | 两者 | 经 lwIP STA 数据面执行 DNS + ICMP ping（count 1-10，默认 1；超时默认 2000ms）。 |
+| `iperf tcp client <IPv4> [duration_sec]` | 两者 | Host Sim 主动 TCP 发送至 Mac iPerf2 server（默认 30 秒）。 |
+| `iperf tcp server [duration_sec]` | 两者 | Host Sim TCP 接收 Mac iPerf2 client。 |
+| `iperf udp client <IPv4> [duration_sec] [mbps]` | 两者 | Host Sim 按 iPerf2 UDP 格式发送（默认 30 秒、20 Mbps）。 |
+| `iperf udp server [duration_sec]` | 两者 | Host Sim 接收 iPerf2 UDP 并报告丢包、乱序和 jitter。 |
 | `ble central\|peripheral` | 仅 USB | 同步运行完整 BLE 场景（阻塞至结束），选项沿用 `--ble-*` 参数。 |
 | `help` / `quit` / `exit` | 两者 | 列出命令 / 退出。 |
 
@@ -221,6 +225,14 @@ TTY）输入时无提示符，读到 EOF 后自然退出。
 
 SSID/payload 为任意字节串：合法 UTF-8 原样输出；否则字段内容替换为可打印
 形式，并附加 `<key>_hex` 字段携带原始字节的十六进制。
+
+`status` 在 DHCP 完成后带有 `dhcp_ipv4`，供 Mac 侧 client 使用。iPerf 使用
+iPerf2 端口 5001（不兼容 iPerf3）：先在 Mac 执行 `brew install iperf`，并先启动
+server。四项手工验证矩阵为：`iperf -s -i 3` + `iperf tcp client <mac-ip> 30`；
+`iperf -c <dhcp-ip> -t 30 -i 3` + `iperf tcp server 30`；`iperf -u -s -i 3` +
+`iperf udp client <mac-ip> 30 20`；以及 `iperf -u -c <dhcp-ip> -t 30 -i 3 -b 20M`
+`iperf udp server 30`。REPL 会输出 `iperf_started`、每 3 秒的
+`iperf_interval` 和最终 `iperf_result` JSON 行。
 
 管道驱动示例：
 

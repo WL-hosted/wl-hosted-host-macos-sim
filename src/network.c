@@ -57,6 +57,23 @@ typedef struct link_request {
     bool up;
 } link_request_t;
 
+static bool frame_for_netif(
+    const sim_network_t *network, const uint8_t *frame
+) {
+    static const uint8_t broadcast[ETH_HWADDR_LEN] = {
+        0xffu,
+        0xffu,
+        0xffu,
+        0xffu,
+        0xffu,
+        0xffu,
+    };
+
+    return memcmp(frame, broadcast, sizeof(broadcast)) == 0 ||
+           (network->netif.hwaddr_len == ETH_HWADDR_LEN &&
+            memcmp(frame, network->netif.hwaddr, ETH_HWADDR_LEN) == 0);
+}
+
 static void ping_wait_for_dhcp(void *argument);
 static void ping_tick(void *argument);
 static void ping_deadline(void *argument);
@@ -95,11 +112,12 @@ static void finish_ping(sim_network_t *network, const char *detail) {
 static err_t link_output(struct netif *netif, struct pbuf *pbuf) {
     sim_network_t *network = netif->state;
     uint8_t frame[1518];
+    int result;
     if (pbuf->tot_len > sizeof(frame) ||
         pbuf_copy_partial(pbuf, frame, pbuf->tot_len, 0u) != pbuf->tot_len)
         return ERR_BUF;
-    return network->send(network->context, frame, pbuf->tot_len) == 0 ? ERR_OK
-                                                                      : ERR_IF;
+    result = network->send(network->context, frame, pbuf->tot_len);
+    return result == 0 ? ERR_OK : result > 0 ? ERR_WOULDBLOCK : ERR_IF;
 }
 
 static err_t initialize_netif(struct netif *netif) {
@@ -227,12 +245,13 @@ void sim_network_link_down(sim_network_t *network) {
     (void)tcpip_callback_wait(apply_link, &request);
 }
 
-int sim_network_input(
+static int queue_input(
     sim_network_t *network, const uint8_t *frame, size_t size
 ) {
     struct pbuf *pbuf;
     err_t result;
-    if (network == NULL || frame == NULL || size < 14u || size > 1518u)
+    if (!netif_is_up(&network->netif) || !netif_is_link_up(&network->netif) ||
+        network->netif.hwaddr_len != ETH_HWADDR_LEN)
         return -1;
     pbuf = pbuf_alloc(PBUF_RAW, (u16_t)size, PBUF_POOL);
     if (pbuf == NULL || pbuf_take(pbuf, frame, size) != ERR_OK) {
@@ -244,6 +263,24 @@ int sim_network_input(
     if (result != ERR_OK)
         pbuf_free(pbuf);
     return result == ERR_OK ? 0 : -1;
+}
+
+int sim_network_input(
+    sim_network_t *network, const uint8_t *frame, size_t size
+) {
+    if (network == NULL || frame == NULL || size < 14u || size > 1518u)
+        return -1;
+    /* esp_wifi_internal_reg_rxcb can surface Ethernet traffic that is not
+     * addressed to this STA. Feeding every such frame through tcpip_callback
+     * fills the bounded tcpip mailbox and can drop a TCP SYN-ACK before lwIP
+     * sees it. DHCP/ARP broadcasts and frames addressed to our netif are the
+     * only inputs this single-STA adapter needs. */
+    if (!frame_for_netif(network, frame))
+        return 0;
+    /* tcpip_input itself enqueues the pbuf for the tcpip thread. Do not put
+     * another tcpip_callback in front of it: that separate bounded API-message
+     * pool can otherwise reject a valid unicast packet under RX load. */
+    return queue_input(network, frame, size);
 }
 
 static void prepare_echo(
@@ -469,4 +506,35 @@ int sim_network_ping(
         return -1;
     }
     return 0;
+}
+
+typedef struct ipv4_request {
+    sim_network_t *network;
+    bool ready;
+    char address[16];
+} ipv4_request_t;
+
+static void query_ipv4(void *argument) {
+    ipv4_request_t *request = argument;
+    struct netif *netif = &request->network->netif;
+    if (!netif_is_up(netif) || !netif_is_link_up(netif) ||
+        ip4_addr_isany_val(*netif_ip4_addr(netif)))
+        return;
+    request->ready = ip4addr_ntoa_r(
+                         netif_ip4_addr(netif),
+                         request->address,
+                         (int)sizeof(request->address)
+                     ) != NULL;
+}
+
+bool sim_network_ipv4(sim_network_t *network, char address[16]) {
+    ipv4_request_t request;
+    if (network == NULL || address == NULL)
+        return false;
+    memset(&request, 0, sizeof(request));
+    request.network = network;
+    if (tcpip_callback_wait(query_ipv4, &request) != ERR_OK || !request.ready)
+        return false;
+    memcpy(address, request.address, sizeof(request.address));
+    return true;
 }
