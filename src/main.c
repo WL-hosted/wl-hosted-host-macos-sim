@@ -4,6 +4,7 @@
 #include "wlh/log.h"
 #include "wlh/posix_osal.h"
 
+#include <CommonCrypto/CommonDigest.h>
 #include <signal.h>
 #include <stdatomic.h>
 #include <stdio.h>
@@ -11,10 +12,10 @@
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
-#include <CommonCrypto/CommonDigest.h>
 
 #include "sim_sideband.pb.h"
 #include "wlh/host.h"
+#include <ota.pb.h>
 #include <pb_decode.h>
 #include <pb_encode.h>
 #include <wifi.pb.h>
@@ -38,6 +39,7 @@ typedef struct app {
     const char *ota_image;
     const char *ota_version;
     uint32_t ota_timeout_ms;
+    uint64_t ota_image_size;
 
     pthread_t rx_thread;
     pthread_mutex_t state_mutex;
@@ -51,6 +53,11 @@ typedef struct app {
     wlh_host_ota_begin_response_t ota_begin;
     bool ota_query_done;
     wlh_host_ota_query_response_t ota_query;
+    unsigned ota_credit_events;
+    unsigned ota_credit_seen;
+    bool ota_activate_done;
+    wlh_host_result_t ota_activate_result;
+    bool ota_left_ready;
     bool scan_complete;
     bool connected;
     bool disconnected;
@@ -233,29 +240,59 @@ static void completion(
 }
 
 static void ota_begin_completion(
-    void *context, wlh_host_result_t result, uint16_t domain, int16_t status,
+    void *context,
+    wlh_host_result_t result,
+    uint16_t domain,
+    int16_t status,
     const wlh_host_ota_begin_response_t *response
 ) {
     app_t *app = context;
-    (void)domain; (void)status;
+    (void)domain;
+    (void)status;
     pthread_mutex_lock(&app->state_mutex);
     app->last_completion_result = result;
     app->ota_begin_done = true;
-    if (response != NULL) app->ota_begin = *response;
+    if (response != NULL)
+        app->ota_begin = *response;
     pthread_cond_broadcast(&app->state_changed);
     pthread_mutex_unlock(&app->state_mutex);
 }
 
 static void ota_query_completion(
-    void *context, wlh_host_result_t result, uint16_t domain, int16_t status,
+    void *context,
+    wlh_host_result_t result,
+    uint16_t domain,
+    int16_t status,
     const wlh_host_ota_query_response_t *response
 ) {
     app_t *app = context;
-    (void)domain; (void)status;
+    (void)domain;
+    (void)status;
     pthread_mutex_lock(&app->state_mutex);
     app->last_completion_result = result;
     app->ota_query_done = true;
-    if (response != NULL) app->ota_query = *response;
+    if (response != NULL)
+        app->ota_query = *response;
+    pthread_cond_broadcast(&app->state_changed);
+    pthread_mutex_unlock(&app->state_mutex);
+}
+
+static void ota_activate_completion(
+    void *context,
+    wlh_host_result_t result,
+    uint16_t domain,
+    int16_t status,
+    const uint8_t *payload,
+    size_t payload_size
+) {
+    app_t *app = context;
+    (void)domain;
+    (void)status;
+    (void)payload;
+    (void)payload_size;
+    pthread_mutex_lock(&app->state_mutex);
+    app->ota_activate_done = true;
+    app->ota_activate_result = result;
     pthread_cond_broadcast(&app->state_changed);
     pthread_mutex_unlock(&app->state_mutex);
 }
@@ -263,6 +300,7 @@ static void ota_query_completion(
 static void ota_tx_ready(void *context) {
     app_t *app = context;
     pthread_mutex_lock(&app->state_mutex);
+    app->ota_credit_events++;
     pthread_cond_broadcast(&app->state_changed);
     pthread_mutex_unlock(&app->state_mutex);
 }
@@ -420,6 +458,9 @@ static void host_event(void *context, const wlh_host_event_t *event) {
     }
     if (event->kind == WLH_HOST_EVENT_USER_MESSAGE_RESULT)
         app->user_result_received = true;
+    if (event->kind == WLH_HOST_EVENT_STATE_CHANGED &&
+        event->state != WLH_HOST_STATE_READY)
+        app->ota_left_ready = true;
     pthread_cond_broadcast(&app->state_changed);
     pthread_mutex_unlock(&app->state_mutex);
     if (link_up && app->network != NULL) {
@@ -432,6 +473,30 @@ static void host_event(void *context, const wlh_host_event_t *event) {
         sim_network_link_down(app->network);
     if (event->kind == WLH_HOST_EVENT_WIFI_SCAN_RESULT)
         log_scan_results(event);
+    if (event->kind == WLH_HOST_EVENT_OTA_PROGRESS) {
+        wlh_protocol_v1_OtaProgressEvent progress =
+            wlh_protocol_v1_OtaProgressEvent_init_zero;
+        pb_istream_t stream =
+            pb_istream_from_buffer(event->payload, event->payload_size);
+        if (pb_decode(
+                &stream, wlh_protocol_v1_OtaProgressEvent_fields, &progress
+            )) {
+            unsigned long percent =
+                app->ota_image_size == 0u
+                    ? 0u
+                    : (unsigned long)(progress.bytes_received * 100u /
+                                      app->ota_image_size);
+            WLH_LOGI(
+                "host-sim",
+                "OTA progress: transfer=%lu state=%u bytes=%llu/%llu (%lu%%)",
+                (unsigned long)progress.transfer_id,
+                (unsigned)progress.state,
+                (unsigned long long)progress.bytes_received,
+                (unsigned long long)app->ota_image_size,
+                percent
+            );
+        }
+    }
     WLH_LOGI(
         "host-sim",
         "event kind=%d state=%d service=%u method=%u bytes=%zu",
@@ -1017,8 +1082,18 @@ static int run_ble_scenario(app_t *app, const char *scenario) {
     return result;
 }
 
-static bool ota_begin_done(app_t *app) { return app->ota_begin_done; }
-static bool ota_query_done(app_t *app) { return app->ota_query_done; }
+static bool ota_begin_done(app_t *app) {
+    return app->ota_begin_done;
+}
+static bool ota_query_done(app_t *app) {
+    return app->ota_query_done;
+}
+static bool ota_credit_available(app_t *app) {
+    return app->ota_credit_events != app->ota_credit_seen;
+}
+static bool ota_activate_finished_or_rebooting(app_t *app) {
+    return app->ota_activate_done || app->ota_left_ready;
+}
 
 static int run_ota_scenario(app_t *app) {
     FILE *file;
@@ -1032,49 +1107,103 @@ static int run_ota_scenario(app_t *app) {
         return -1;
     }
     file = fopen(app->ota_image, "rb");
-    if (file == NULL || fseek(file, 0, SEEK_END) != 0 || (file_size = ftell(file)) <= 0 ||
-        fseek(file, 0, SEEK_SET) != 0) { if (file != NULL) fclose(file); return -1; }
+    if (file == NULL || fseek(file, 0, SEEK_END) != 0 ||
+        (file_size = ftell(file)) <= 0 || fseek(file, 0, SEEK_SET) != 0) {
+        if (file != NULL)
+            fclose(file);
+        return -1;
+    }
     image = malloc((size_t)file_size);
-    if (image == NULL || fread(image, 1u, (size_t)file_size, file) != (size_t)file_size) {
-        free(image); fclose(file); return -1;
+    if (image == NULL ||
+        fread(image, 1u, (size_t)file_size, file) != (size_t)file_size) {
+        free(image);
+        fclose(file);
+        return -1;
     }
     fclose(file);
     memset(&params, 0, sizeof(params));
     params.image_size = (uint64_t)file_size;
+    app->ota_image_size = (uint64_t)file_size;
     params.target_version = app->ota_version;
     CC_SHA256(image, (CC_LONG)file_size, params.sha256);
     app->ota_query_done = false;
     if (!wait_until(app, ready, 10000u) ||
-        wlh_host_ota_query(&app->host, ota_query_completion, app) != WLH_HOST_OK ||
-        !wait_until(app, ota_query_done, 5000u)) goto fail;
+        wlh_host_ota_query(&app->host, ota_query_completion, app) !=
+            WLH_HOST_OK ||
+        !wait_until(app, ota_query_done, 5000u))
+        goto fail;
     if (app->ota_query.transfer_id != 0u) {
         app->completions = 0u;
-        if (wlh_host_ota_abort(&app->host, app->ota_query.transfer_id, completion, app) != WLH_HOST_OK ||
-            !wait_until(app, one_completion, 5000u)) goto fail;
+        if (wlh_host_ota_abort(
+                &app->host, app->ota_query.transfer_id, completion, app
+            ) != WLH_HOST_OK ||
+            !wait_until(app, one_completion, 5000u))
+            goto fail;
     }
     app->ota_begin_done = false;
-    if (wlh_host_ota_begin(&app->host, &params, ota_begin_completion, app) != WLH_HOST_OK ||
-        !wait_until(app, ota_begin_done, timeout) || app->last_completion_result != WLH_HOST_OK) goto fail;
+    if (wlh_host_ota_begin(&app->host, &params, ota_begin_completion, app) !=
+            WLH_HOST_OK ||
+        !wait_until(app, ota_begin_done, timeout) ||
+        app->last_completion_result != WLH_HOST_OK)
+        goto fail;
     while (offset < (size_t)file_size) {
         size_t chunk = app->ota_begin.stream_chunk_size;
         wlh_host_result_t result;
-        if (chunk == 0u) goto fail;
-        if (chunk > (size_t)file_size - offset) chunk = (size_t)file_size - offset;
+        if (chunk == 0u)
+            goto fail;
+        if (chunk > (size_t)file_size - offset)
+            chunk = (size_t)file_size - offset;
         do {
-            result = wlh_host_ota_stream_send(&app->host, app->ota_begin.transfer_id,
-                                              offset, image + offset, chunk);
-            if (result == WLH_HOST_NO_CREDIT) (void)wait_until(app, ready, 100u);
+            result = wlh_host_ota_stream_send(
+                &app->host,
+                app->ota_begin.transfer_id,
+                offset,
+                image + offset,
+                chunk
+            );
+            if (result == WLH_HOST_NO_CREDIT) {
+                pthread_mutex_lock(&app->state_mutex);
+                app->ota_credit_seen = app->ota_credit_events;
+                pthread_mutex_unlock(&app->state_mutex);
+                if (!wait_until(app, ota_credit_available, 10000u))
+                    goto fail;
+            }
         } while (result == WLH_HOST_NO_CREDIT && !interrupted);
-        if (result != WLH_HOST_OK) goto fail;
+        if (result != WLH_HOST_OK)
+            goto fail;
         offset += chunk;
     }
     app->completions = 0u;
-    if (wlh_host_ota_finalize(&app->host, app->ota_begin.transfer_id, offset, completion, app) != WLH_HOST_OK ||
-        !wait_until(app, one_completion, timeout)) goto fail;
-    app->completions = 0u;
-    if (wlh_host_ota_activate(&app->host, app->ota_begin.transfer_id, true, completion, app) != WLH_HOST_OK)
+    if (wlh_host_ota_finalize(
+            &app->host, app->ota_begin.transfer_id, offset, completion, app
+        ) != WLH_HOST_OK ||
+        !wait_until(app, one_completion, timeout))
         goto fail;
-    (void)wait_until(app, ready, timeout);
+    app->ota_activate_done = false;
+    app->ota_left_ready = false;
+    if (wlh_host_ota_activate(
+            &app->host,
+            app->ota_begin.transfer_id,
+            true,
+            ota_activate_completion,
+            app
+        ) != WLH_HOST_OK ||
+        !wait_until(app, ota_activate_finished_or_rebooting, 10000u))
+        goto fail;
+    if (app->ota_activate_done && app->ota_activate_result != WLH_HOST_OK)
+        goto fail;
+    if (!wait_until(app, not_ready, 10000u) || !wait_until(app, ready, timeout))
+        goto fail;
+    app->ota_query_done = false;
+    if (wlh_host_ota_query(&app->host, ota_query_completion, app) !=
+            WLH_HOST_OK ||
+        !wait_until(app, ota_query_done, 5000u) ||
+        app->last_completion_result != WLH_HOST_OK ||
+        app->ota_query.transfer_id != 0u)
+        goto fail;
+    if (app->ota_version != NULL &&
+        strcmp(wlh_host_get_peer_version(&app->host), app->ota_version) != 0)
+        goto fail;
     free(image);
     return 0;
 fail:
