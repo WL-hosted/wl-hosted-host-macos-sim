@@ -134,6 +134,9 @@ target_compile_definitions(wlh-host-macos-sim PRIVATE WLH_ENABLE_TEST_HOOKS)
 target_link_libraries(wlh-host-macos-sim PRIVATE
     wlh_host_sim_platform wlh::host_core wlh::posix_osal wlh::log
     wlh_sim_nanopb wlh_ble Threads::Threads)
+if(APPLE)
+    target_link_libraries(wlh-host-macos-sim PRIVATE "-framework CoreFoundation")
+endif()
 
 foreach(target wlh_host_sim_lwip wlh_host_sim_platform wlh-host-macos-sim)
     set_target_properties(${target} PROPERTIES C_EXTENSIONS OFF)

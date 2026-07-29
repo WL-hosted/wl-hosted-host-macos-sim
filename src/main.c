@@ -11,6 +11,7 @@
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
+#include <CommonCrypto/CommonDigest.h>
 
 #include "sim_sideband.pb.h"
 #include "wlh/host.h"
@@ -34,6 +35,9 @@ typedef struct app {
     sim_usb_transport_t *usb;
     const char *ssid;
     const char *credential;
+    const char *ota_image;
+    const char *ota_version;
+    uint32_t ota_timeout_ms;
 
     pthread_t rx_thread;
     pthread_mutex_t state_mutex;
@@ -42,6 +46,11 @@ typedef struct app {
     atomic_bool running;
     atomic_uint fail_allocations;
     unsigned completions;
+    wlh_host_result_t last_completion_result;
+    bool ota_begin_done;
+    wlh_host_ota_begin_response_t ota_begin;
+    bool ota_query_done;
+    wlh_host_ota_query_response_t ota_query;
     bool scan_complete;
     bool connected;
     bool disconnected;
@@ -221,6 +230,41 @@ static void completion(
         domain,
         status
     );
+}
+
+static void ota_begin_completion(
+    void *context, wlh_host_result_t result, uint16_t domain, int16_t status,
+    const wlh_host_ota_begin_response_t *response
+) {
+    app_t *app = context;
+    (void)domain; (void)status;
+    pthread_mutex_lock(&app->state_mutex);
+    app->last_completion_result = result;
+    app->ota_begin_done = true;
+    if (response != NULL) app->ota_begin = *response;
+    pthread_cond_broadcast(&app->state_changed);
+    pthread_mutex_unlock(&app->state_mutex);
+}
+
+static void ota_query_completion(
+    void *context, wlh_host_result_t result, uint16_t domain, int16_t status,
+    const wlh_host_ota_query_response_t *response
+) {
+    app_t *app = context;
+    (void)domain; (void)status;
+    pthread_mutex_lock(&app->state_mutex);
+    app->last_completion_result = result;
+    app->ota_query_done = true;
+    if (response != NULL) app->ota_query = *response;
+    pthread_cond_broadcast(&app->state_changed);
+    pthread_mutex_unlock(&app->state_mutex);
+}
+
+static void ota_tx_ready(void *context) {
+    app_t *app = context;
+    pthread_mutex_lock(&app->state_mutex);
+    pthread_cond_broadcast(&app->state_changed);
+    pthread_mutex_unlock(&app->state_mutex);
 }
 
 static void device_info_completion(
@@ -973,6 +1017,71 @@ static int run_ble_scenario(app_t *app, const char *scenario) {
     return result;
 }
 
+static bool ota_begin_done(app_t *app) { return app->ota_begin_done; }
+static bool ota_query_done(app_t *app) { return app->ota_query_done; }
+
+static int run_ota_scenario(app_t *app) {
+    FILE *file;
+    long file_size;
+    uint8_t *image;
+    size_t offset = 0u;
+    wlh_host_ota_begin_params_t params;
+    uint32_t timeout = app->ota_timeout_ms == 0u ? 30000u : app->ota_timeout_ms;
+    if (!app->use_usb || app->ota_image == NULL) {
+        WLH_LOGE("host-sim", "OTA requires --usb and --ota-image");
+        return -1;
+    }
+    file = fopen(app->ota_image, "rb");
+    if (file == NULL || fseek(file, 0, SEEK_END) != 0 || (file_size = ftell(file)) <= 0 ||
+        fseek(file, 0, SEEK_SET) != 0) { if (file != NULL) fclose(file); return -1; }
+    image = malloc((size_t)file_size);
+    if (image == NULL || fread(image, 1u, (size_t)file_size, file) != (size_t)file_size) {
+        free(image); fclose(file); return -1;
+    }
+    fclose(file);
+    memset(&params, 0, sizeof(params));
+    params.image_size = (uint64_t)file_size;
+    params.target_version = app->ota_version;
+    CC_SHA256(image, (CC_LONG)file_size, params.sha256);
+    app->ota_query_done = false;
+    if (!wait_until(app, ready, 10000u) ||
+        wlh_host_ota_query(&app->host, ota_query_completion, app) != WLH_HOST_OK ||
+        !wait_until(app, ota_query_done, 5000u)) goto fail;
+    if (app->ota_query.transfer_id != 0u) {
+        app->completions = 0u;
+        if (wlh_host_ota_abort(&app->host, app->ota_query.transfer_id, completion, app) != WLH_HOST_OK ||
+            !wait_until(app, one_completion, 5000u)) goto fail;
+    }
+    app->ota_begin_done = false;
+    if (wlh_host_ota_begin(&app->host, &params, ota_begin_completion, app) != WLH_HOST_OK ||
+        !wait_until(app, ota_begin_done, timeout) || app->last_completion_result != WLH_HOST_OK) goto fail;
+    while (offset < (size_t)file_size) {
+        size_t chunk = app->ota_begin.stream_chunk_size;
+        wlh_host_result_t result;
+        if (chunk == 0u) goto fail;
+        if (chunk > (size_t)file_size - offset) chunk = (size_t)file_size - offset;
+        do {
+            result = wlh_host_ota_stream_send(&app->host, app->ota_begin.transfer_id,
+                                              offset, image + offset, chunk);
+            if (result == WLH_HOST_NO_CREDIT) (void)wait_until(app, ready, 100u);
+        } while (result == WLH_HOST_NO_CREDIT && !interrupted);
+        if (result != WLH_HOST_OK) goto fail;
+        offset += chunk;
+    }
+    app->completions = 0u;
+    if (wlh_host_ota_finalize(&app->host, app->ota_begin.transfer_id, offset, completion, app) != WLH_HOST_OK ||
+        !wait_until(app, one_completion, timeout)) goto fail;
+    app->completions = 0u;
+    if (wlh_host_ota_activate(&app->host, app->ota_begin.transfer_id, true, completion, app) != WLH_HOST_OK)
+        goto fail;
+    (void)wait_until(app, ready, timeout);
+    free(image);
+    return 0;
+fail:
+    free(image);
+    return -1;
+}
+
 static int run_scenario(app_t *app, const char *scenario) {
     wlh_wifi_scan_params_t scan = {1u, NULL, 0u, true, 8u};
     static const uint8_t default_ssid[] = "WPA2Net";
@@ -1012,6 +1121,9 @@ static int run_scenario(app_t *app, const char *scenario) {
         }
         return run_ble_scenario(app, scenario);
     }
+
+    if (strcmp(scenario, "ota") == 0)
+        return run_ota_scenario(app);
 
     if (!wait_until(app, ready, 5000u))
         return -1;
@@ -1080,7 +1192,7 @@ static void usage(const char *program) {
     fprintf(
         stderr,
         "usage: %s --ipc connect:PATH|fd:N | --usb VID:PID [--scenario "
-        "smoke|scan|connect|recovery|services|managed|ble-central|"
+        "smoke|scan|connect|recovery|services|managed|ota|ble-central|"
         "ble-peripheral|ble-coexistence] "
         "[--monitor-interval-ms N] [--rpc-timeout-ms N] "
         "[--ssid SSID] [--credential CREDENTIAL] "
@@ -1120,6 +1232,7 @@ int main(int argc, char **argv) {
 
     memset(&app, 0, sizeof(app));
     app.monitor_interval_ms = 1000u;
+    app.ota_timeout_ms = 30000u;
     app.usb_config = (sim_usb_config_t){0x303au,
                                         0x8201u,
                                         0u,
@@ -1155,6 +1268,12 @@ int main(int argc, char **argv) {
             app.monitor_interval_ms = (uint32_t)strtoul(argv[index], NULL, 10);
         else if (strcmp(argv[index], "--rpc-timeout-ms") == 0 && ++index < argc)
             rpc_timeout_ms = (uint32_t)strtoul(argv[index], NULL, 10);
+        else if (strcmp(argv[index], "--ota-image") == 0 && ++index < argc)
+            app.ota_image = argv[index];
+        else if (strcmp(argv[index], "--ota-version") == 0 && ++index < argc)
+            app.ota_version = argv[index];
+        else if (strcmp(argv[index], "--ota-timeout-ms") == 0 && ++index < argc)
+            app.ota_timeout_ms = (uint32_t)strtoul(argv[index], NULL, 10);
         else if (strcmp(argv[index], "--ble-bond-store") == 0 && ++index < argc)
             app.ble.bond_store_path = argv[index];
         else if (strcmp(argv[index], "--ble-clear-bonds") == 0)
@@ -1242,6 +1361,8 @@ int main(int argc, char **argv) {
     config.bluetooth_hci_rx = wlh_ble_hci_rx;
     config.bluetooth_hci_tx_ready = wlh_ble_hci_tx_ready;
     config.bluetooth_context = NULL;
+    config.ota_stream_tx_ready = ota_tx_ready;
+    config.ota_context = &app;
 
     config.max_frame_size = 4096u;
     config.rpc_timeout_ms = rpc_timeout_ms;
