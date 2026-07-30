@@ -916,7 +916,13 @@ static bool term_is_unsupported(void) {
  * JSON on stdout, logs on stderr) no longer maps to '\r\n' and renders as
  * staircase output. Restore the pre-edit output post-processing flags right
  * after linenoiseEditStart(); linenoise itself only writes explicit '\r'
- * plus escape sequences, so this is safe. */
+ * plus escape sequences, so this is safe.
+ *
+ * Raw mode also clears ICRNL, and linenoise only accepts CR as end-of-line.
+ * A pty driven by a test harness or script sends bare LF, which linenoise
+ * then inserts as an ordinary character, so commands accumulate in the edit
+ * buffer and never execute. Set INLCR so incoming LF arrives as CR. Real
+ * terminals send CR for Enter, so no interactive behavior changes. */
 static char *read_line_tty(const char *prompt) {
     struct linenoiseState state;
     struct termios cooked;
@@ -942,6 +948,7 @@ static char *read_line_tty(const char *prompt) {
         struct termios raw;
         if (tcgetattr(STDIN_FILENO, &raw) == 0) {
             raw.c_oflag = cooked.c_oflag;
+            raw.c_iflag |= INLCR;
             (void)tcsetattr(STDIN_FILENO, TCSANOW, &raw);
         }
     }
