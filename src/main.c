@@ -1492,7 +1492,7 @@ int main(int argc, char **argv) {
     config.rpc_timeout_ms = rpc_timeout_ms;
     config.heartbeat_timeout_ms = 5000u;
     config.max_pending_rpc = 8u;
-    config.core_queue_depth = 16u;
+    config.core_queue_depth = 64u;
     config.stop_timeout_ms = 3000u;
 
     if (wlh_host_init(&app.host, &config) != WLH_HOST_OK)

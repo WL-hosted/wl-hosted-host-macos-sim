@@ -356,6 +356,15 @@ static int cmd_status(app_t *app, int argc, char **argv, bool *quit) {
         cJSON_AddNumberToObject(doc, "tx_frames", diagnostics.tx_frames);
         cJSON_AddNumberToObject(doc, "rx_frames", diagnostics.rx_frames);
         cJSON_AddNumberToObject(doc, "pending_rpc", diagnostics.pending_rpc);
+        /* Data-path admission drops, split by cause. Both must stay at zero on
+         * a healthy link; nonzero eth_no_credit means the flow-control window
+         * is running dry rather than the transport being saturated. */
+        cJSON_AddNumberToObject(
+            doc, "eth_no_credit", diagnostics.ethernet_no_credit
+        );
+        cJSON_AddNumberToObject(
+            doc, "eth_queue_full", diagnostics.ethernet_queue_full
+        );
         cJSON_AddBoolToObject(doc, "wifi_connected", is_connected);
         if (sim_network_ipv4(app->network, ipv4))
             cJSON_AddStringToObject(doc, "dhcp_ipv4", ipv4);
