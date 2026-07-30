@@ -15,6 +15,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
+#include <termios.h>
 #include <unistd.h>
 
 #define REPL_MODE_IPC 0x01u
@@ -882,6 +884,66 @@ static void dispatch_line(app_t *app, char *line, bool *quit) {
 
 /* ---- stdin reader thread ------------------------------------------------- */
 
+#define REPL_EDIT_INITIAL_BUFLEN 4096u
+#define REPL_EDIT_MAX_BUFLEN (1024u * 1024u)
+
+/* Mirrors linenoise's internal unsupported-terminal blacklist, which is not
+ * exported; on these terminals linenoise() degrades to a plain reader. */
+static bool term_is_unsupported(void) {
+    static const char *const unsupported[] = {"dumb", "cons25", "emacs"};
+    const char *term = getenv("TERM");
+    size_t i;
+    if (term == NULL)
+        return false;
+    for (i = 0; i < sizeof(unsupported) / sizeof(unsupported[0]); ++i) {
+        if (strcasecmp(term, unsupported[i]) == 0)
+            return true;
+    }
+    return false;
+}
+
+/* Blocking TTY line read built on the linenoise non-blocking API. Entering
+ * raw mode clears OPOST, so '\n' written meanwhile by other threads (async
+ * JSON on stdout, logs on stderr) no longer maps to '\r\n' and renders as
+ * staircase output. Restore the pre-edit output post-processing flags right
+ * after linenoiseEditStart(); linenoise itself only writes explicit '\r'
+ * plus escape sequences, so this is safe. */
+static char *read_line_tty(const char *prompt) {
+    struct linenoiseState state;
+    struct termios cooked;
+    bool have_cooked;
+    char *buf;
+    char *line;
+
+    if (term_is_unsupported())
+        return linenoise(prompt);
+
+    buf = malloc(REPL_EDIT_INITIAL_BUFLEN);
+    if (buf == NULL)
+        return NULL;
+
+    have_cooked = tcgetattr(STDIN_FILENO, &cooked) == 0;
+    if (linenoiseEditStart(
+            &state, -1, -1, buf, REPL_EDIT_INITIAL_BUFLEN, prompt
+        ) == -1) {
+        free(buf);
+        return NULL;
+    }
+    if (have_cooked) {
+        struct termios raw;
+        if (tcgetattr(STDIN_FILENO, &raw) == 0) {
+            raw.c_oflag = cooked.c_oflag;
+            (void)tcsetattr(STDIN_FILENO, TCSANOW, &raw);
+        }
+    }
+    state.buflen_max = REPL_EDIT_MAX_BUFLEN;
+    while ((line = linenoiseEditFeed(&state)) == linenoiseEditMore)
+        ;
+    linenoiseEditStop(&state);
+    free(state.buf);
+    return line;
+}
+
 static void sigusr1_noop(int signal_number) {
     (void)signal_number;
 }
@@ -893,7 +955,7 @@ static void *reader_main(void *context) {
         char *line;
         if (atomic_load(&app->repl.reader_stop))
             break;
-        line = linenoise(tty ? "wlh> " : "");
+        line = tty ? read_line_tty("wlh> ") : linenoise("");
         if (atomic_load(&app->repl.reader_stop)) {
             free(line);
             break;
