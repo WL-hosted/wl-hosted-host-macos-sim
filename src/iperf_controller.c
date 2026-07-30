@@ -225,14 +225,15 @@ static bool send_udp_server_report(
          attempt < IPERF_UDP_ACK_ATTEMPTS && !cancelled(controller);
          ++attempt) {
         int ready;
-        if (lwip_sendto(
-                fd,
-                report,
-                sizeof(report),
-                0,
-                (const struct sockaddr *)peer,
-                peer_size
-            ) != (int)sizeof(report))
+        int sent = lwip_sendto(
+            fd,
+            report,
+            sizeof(report),
+            0,
+            (const struct sockaddr *)peer,
+            peer_size
+        );
+        if (sent != (int)sizeof(report))
             return false;
         ready = wait_ready(fd, false, IPERF_UDP_ACK_WAIT_MS);
         if (ready < 0)
@@ -252,6 +253,7 @@ static void *worker_main(void *argument) {
     struct sockaddr_in peer;
     uint64_t started = wlh_app_monotonic_ms(), last_report = started,
              last_bytes = 0u, bytes = 0u, udp_first_packet_ms = 0u;
+    uint32_t udp_client_duration_ms = 0u;
     wlh_iperf2_udp_stats_t udp;
     struct sockaddr_in udp_peer;
     socklen_t udp_peer_size = 0u;
@@ -338,6 +340,24 @@ static void *worker_main(void *argument) {
             (uint64_t)controller->request.duration_sec * 1000u;
         if (controller->request.protocol == WLH_IPERF_UDP &&
             controller->request.role == WLH_IPERF_SERVER) {
+            if (udp_first_packet_ms != 0u && udp_client_duration_ms != 0u &&
+                current - udp_first_packet_ms >= udp_client_duration_ms) {
+                if (!send_udp_server_report(
+                        controller,
+                        data_fd,
+                        &udp_peer,
+                        udp_peer_size,
+                        udp.bytes,
+                        current - udp_first_packet_ms,
+                        &udp,
+                        false
+                    )) {
+                    detail = "failed to send UDP server report";
+                    break;
+                }
+                success = true;
+                break;
+            }
             /* The listening interval is anchored at server start, not at the
              * first packet. Under loss/backpressure a packet can arrive much
              * later than the client began its test; extending the deadline
@@ -458,7 +478,7 @@ static void *worker_main(void *argument) {
                             udp.bytes,
                             elapsed_ms,
                             &udp,
-                            false
+                            true
                         )) {
                         detail = "failed to send UDP server report";
                         break;
@@ -466,8 +486,12 @@ static void *worker_main(void *argument) {
                     success = true;
                     break;
                 }
-                if (udp_first_packet_ms == 0u)
+                if (udp_first_packet_ms == 0u) {
                     udp_first_packet_ms = wlh_app_monotonic_ms();
+                    (void)wlh_iperf2_udp_decode_client_duration_ms(
+                        payload, (uint32_t)count, &udp_client_duration_ms
+                    );
+                }
                 udp_peer = sender;
                 udp_peer_size = sender_size;
                 wlh_iperf2_udp_stats_add(
@@ -500,19 +524,31 @@ static void *worker_main(void *argument) {
         };
         wlh_iperf2_udp_encode(payload, &final);
         {
-            uint64_t deadline_ms = wlh_app_monotonic_ms() + 1000u;
-            int count;
-            do {
-                count = lwip_send(data_fd, payload, packet_size, 0);
-                if (count == (int)packet_size)
+            uint8_t report[WLH_IPERF2_DEFAULT_UDP_PACKET_SIZE];
+            bool report_received = false;
+            uint32_t attempt;
+            for (attempt = 0u;
+                 attempt < IPERF_UDP_ACK_ATTEMPTS && !cancelled(controller);
+                 ++attempt) {
+                int count = lwip_send(data_fd, payload, packet_size, 0);
+                if (count != (int)packet_size) {
+                    if (!send_backpressured())
+                        break;
+                    sys_msleep(1u);
+                    continue;
+                }
+                int ready = wait_ready(data_fd, false, IPERF_UDP_ACK_WAIT_MS);
+                if (ready < 0)
                     break;
-                if (!send_backpressured())
+                if (ready == 0)
+                    continue;
+                if (lwip_recv(data_fd, report, sizeof(report), 0) > 0) {
+                    report_received = true;
                     break;
-                sys_msleep(1u);
-            } while (!cancelled(controller) &&
-                     wlh_app_monotonic_ms() < deadline_ms);
-            if (count != (int)packet_size && strcmp(detail, "completed") == 0)
-                detail = "failed to send UDP end packet";
+                }
+            }
+            if (!report_received && strcmp(detail, "completed") == 0)
+                detail = "failed to receive UDP server report";
         }
     }
     if (cancelled(controller))

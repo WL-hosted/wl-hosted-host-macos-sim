@@ -18,6 +18,31 @@ bool wlh_iperf2_udp_decode(
     return header->microseconds < 1000000u;
 }
 
+bool wlh_iperf2_udp_decode_client_duration_ms(
+    const uint8_t *data, uint32_t size, uint32_t *duration_ms
+) {
+    const uint32_t required_flags = 0x48010000u;
+    uint32_t value;
+    int32_t amount;
+    uint64_t decoded_ms;
+    /* UDP_datagram is 16 bytes in iPerf2 2.2.x.  mAmount is the sixth
+     * 32-bit field of the following client_hdr_v1, at byte offset 36. */
+    if (data == NULL || duration_ms == NULL || size < 40u)
+        return false;
+    memcpy(&value, data + 16u, sizeof(value));
+    if ((ntohl(value) & required_flags) != required_flags)
+        return false;
+    memcpy(&value, data + 36u, sizeof(value));
+    amount = (int32_t)ntohl(value);
+    if (amount >= 0)
+        return false;
+    decoded_ms = (uint64_t)(-(int64_t)amount) * 10u;
+    if (decoded_ms == 0u || decoded_ms > UINT32_MAX)
+        return false;
+    *duration_ms = (uint32_t)decoded_ms;
+    return true;
+}
+
 void wlh_iperf2_udp_encode(
     uint8_t data[WLH_IPERF2_UDP_HEADER_SIZE],
     const wlh_iperf2_udp_header_t *header
@@ -77,12 +102,14 @@ bool wlh_iperf2_udp_encode_server_report(
 ) {
     uint32_t values[28] = {0};
     uint64_t elapsed_us;
+    uint64_t expected_datagrams;
     uint64_t jitter_us;
     size_t index;
     if (data == NULL || stats == NULL ||
         size < WLH_IPERF2_UDP_SERVER_REPORT_SIZE)
         return false;
     elapsed_us = elapsed_ms * 1000u;
+    expected_datagrams = stats->packets + stats->lost;
     jitter_us = (uint64_t)(stats->jitter_ms * 1000.0);
     /* iPerf2 2.2.1's write_UDP_AckFIN() allocates a zeroed UDP_datagram,
      * then places server_hdr immediately after its four 32-bit words. */
@@ -94,7 +121,7 @@ bool wlh_iperf2_udp_encode_server_report(
     values[4] = htonl((uint32_t)(elapsed_us % 1000000u));
     values[5] = htonl((uint32_t)stats->lost);
     values[6] = htonl((uint32_t)stats->out_of_order);
-    values[7] = htonl((uint32_t)stats->packets);
+    values[7] = htonl((uint32_t)expected_datagrams);
     values[8] = htonl((uint32_t)(jitter_us / 1000000u));
     values[9] = htonl((uint32_t)(jitter_us % 1000000u));
     /* server_hdr_extension (indices 10..24) is zero because Host Sim does
@@ -102,7 +129,7 @@ bool wlh_iperf2_udp_encode_server_report(
      * 64-bit counter extension follows it at indices 25..27. */
     values[25] = htonl((uint32_t)(stats->lost >> 32u));
     values[26] = htonl((uint32_t)(stats->out_of_order >> 32u));
-    values[27] = htonl((uint32_t)(stats->packets >> 32u));
+    values[27] = htonl((uint32_t)(expected_datagrams >> 32u));
     for (index = 0; index < sizeof(values) / sizeof(values[0]); ++index)
         memcpy(
             data + WLH_IPERF2_UDP_SERVER_UDP_HEADER_SIZE +

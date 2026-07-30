@@ -21,6 +21,26 @@ int main(void) {
     header.microseconds = 1000000u;
     wlh_iperf2_udp_encode(bytes, &header);
     assert(!wlh_iperf2_udp_decode(bytes, sizeof(bytes), &decoded));
+    {
+        uint8_t client_header[40] = {0};
+        uint32_t value = htonl(0x48010000u);
+        uint32_t duration_ms = 0u;
+        memcpy(client_header + 16u, &value, sizeof(value));
+        value = htonl((uint32_t)-1000);
+        memcpy(client_header + 36u, &value, sizeof(value));
+        assert(wlh_iperf2_udp_decode_client_duration_ms(
+            client_header, sizeof(client_header), &duration_ms
+        ));
+        assert(duration_ms == 10000u);
+        assert(!wlh_iperf2_udp_decode_client_duration_ms(
+            client_header, sizeof(client_header) - 1u, &duration_ms
+        ));
+        value = htonl(1000u);
+        memcpy(client_header + 36u, &value, sizeof(value));
+        assert(!wlh_iperf2_udp_decode_client_duration_ms(
+            client_header, sizeof(client_header), &duration_ms
+        ));
+    }
     wlh_iperf2_udp_stats_init(&stats);
     header = (wlh_iperf2_udp_header_t){0, 1u, 0u};
     wlh_iperf2_udp_stats_add(&stats, &header, 100u, 1010000u);
@@ -43,7 +63,7 @@ int main(void) {
             500000u,
             1u,
             1u,
-            1u,
+            2u,
             0u,
             (uint32_t)((uint64_t)(stats.jitter_ms * 1000.0) % 1000000u),
             0u,
@@ -63,7 +83,7 @@ int main(void) {
             0u,
             1u,
             2u,
-            3u
+            4u
         };
         size_t index;
         stats.packets = 0x300000001u;

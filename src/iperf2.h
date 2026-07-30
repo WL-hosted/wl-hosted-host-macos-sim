@@ -38,6 +38,11 @@ typedef struct wlh_iperf2_udp_stats {
 bool wlh_iperf2_udp_decode(
     const uint8_t *data, uint32_t size, wlh_iperf2_udp_header_t *header
 );
+/* Extracts a time-mode duration from the standard client_udp_testhdr carried
+ * in iPerf2 UDP payloads. */
+bool wlh_iperf2_udp_decode_client_duration_ms(
+    const uint8_t *data, uint32_t size, uint32_t *duration_ms
+);
 void wlh_iperf2_udp_encode(
     uint8_t data[WLH_IPERF2_UDP_HEADER_SIZE],
     const wlh_iperf2_udp_header_t *header

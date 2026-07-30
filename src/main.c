@@ -476,11 +476,15 @@ static void host_event(void *context, const wlh_host_event_t *event) {
 static int network_send(void *context, const uint8_t *frame, size_t size) {
     app_t *app = context;
     static uint32_t frame_count;
+    static uint32_t failure_count;
     wlh_host_result_t result =
         wlh_host_ethernet_sta_send(&app->host, frame, size);
     ++frame_count;
-    if (frame_count <= 5u || result != WLH_HOST_OK ||
-        frame_count % 100u == 0u) {
+    if (result != WLH_HOST_OK)
+        ++failure_count;
+    if (frame_count <= 5u || frame_count % 100u == 0u ||
+        (result != WLH_HOST_OK &&
+         (failure_count <= 5u || failure_count % 100u == 0u))) {
         WLH_LOGI(
             "host-sim",
             "lwIP ethernet output #%lu len=%u result=%d",
@@ -1493,6 +1497,7 @@ int main(int argc, char **argv) {
     config.heartbeat_timeout_ms = 5000u;
     config.max_pending_rpc = 8u;
     config.core_queue_depth = 64u;
+    config.ethernet_tx_depth = 64u;
     config.stop_timeout_ms = 3000u;
 
     if (wlh_host_init(&app.host, &config) != WLH_HOST_OK)
