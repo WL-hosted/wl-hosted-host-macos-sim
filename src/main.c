@@ -23,7 +23,6 @@
 #include <pb_encode.h>
 #include <wifi.pb.h>
 
-#include "ble/ble_app.h"
 #include "ble/hci_transport.h"
 
 typedef struct tx_work {
@@ -252,40 +251,6 @@ static void ota_tx_ready(void *context) {
     pthread_mutex_unlock(&app->state_mutex);
 }
 
-static void device_info_completion(
-    void *context,
-    wlh_host_result_t result,
-    uint16_t domain,
-    int16_t status,
-    const wlh_host_device_info_t *info
-) {
-    app_t *app = context;
-    WLH_LOGI(
-        "host-sim",
-        "device info result=%d domain=%u status=%d",
-        result,
-        domain,
-        status
-    );
-    if (result == WLH_HOST_OK && info != NULL) {
-        unsigned index;
-        WLH_LOGI(
-            "host-sim", "vendor=%s mcu_model=%s", info->vendor, info->mcu_model
-        );
-        WLH_LOGI("host-sim", "board_profile=%s", info->board_profile);
-        fprintf(stdout, "host-sim: uid=");
-        for (index = 0; index < info->uid_size; ++index)
-            fprintf(stdout, "%02x", info->uid[index]);
-        fputc('\n', stdout);
-        fflush(stdout);
-    }
-    pthread_mutex_lock(&app->state_mutex);
-    app->device_info_result = result;
-    app->device_info_done = true;
-    pthread_cond_broadcast(&app->state_changed);
-    pthread_mutex_unlock(&app->state_mutex);
-}
-
 static void usb_on_frame(void *context, const uint8_t *frame, size_t size) {
     app_t *app = context;
     (void)wlh_host_on_frame(&app->host, frame, size);
@@ -506,12 +471,6 @@ static void network_ping_result(
     wlh_sim_v1_SimPingResult message = wlh_sim_v1_SimPingResult_init_zero;
     if (wlh_repl_on_ping_result(app, result))
         return;
-    pthread_mutex_lock(&app->state_mutex);
-    app->ping_results++;
-    if (result->success)
-        app->ping_ok++;
-    pthread_cond_broadcast(&app->state_changed);
-    pthread_mutex_unlock(&app->state_mutex);
     if (!app->ipc.sideband) {
         WLH_LOGI(
             "host-sim",
@@ -915,163 +874,6 @@ static bool not_ready(app_t *app) {
 static bool one_completion(app_t *app) {
     return app->completions >= 1u;
 }
-static bool scan_complete(app_t *app) {
-    return app->scan_complete;
-}
-static bool connected(app_t *app) {
-    return app->connected;
-}
-static bool ethernet_rx(app_t *app) {
-    return app->ethernet_rx;
-}
-static bool disconnected(app_t *app) {
-    return app->disconnected;
-}
-static bool device_info_ready(app_t *app) {
-    return app->device_info_done;
-}
-static bool user_result_arrived(app_t *app) {
-    return app->user_result_received;
-}
-
-static int run_managed(app_t *app) {
-    while (atomic_load(&app->running) && !atomic_load(&interrupted)) {
-        if (!wlh_app_wait_until(app, ready, 30000u))
-            break;
-        app->completions = 0u;
-        (void)wlh_host_wifi_initialize(&app->host, completion, app);
-        /* Repeat INITIALIZE is idempotent; tolerate a missing completion. */
-        if (!wlh_app_wait_until(app, one_completion, 3000u))
-            WLH_LOGW("host-sim", "managed initialize not confirmed");
-        (void)wlh_app_wait_until(app, not_ready, UINT32_MAX);
-    }
-    return atomic_load(&app->running) && !atomic_load(&interrupted) ? -1 : 0;
-}
-
-static bool ping_target_reached(app_t *app) {
-    return app->ping_ok >= app->ping_target;
-}
-
-static void *ping_worker(void *context) {
-    app_t *app = context;
-    uint32_t request_id = 0x40000000u;
-
-    while (atomic_load(&app->ping_worker_running)) {
-        unsigned before;
-        pthread_mutex_lock(&app->state_mutex);
-        before = app->ping_results;
-        pthread_mutex_unlock(&app->state_mutex);
-        if (sim_network_ping(
-                app->network, ++request_id, "one.one.one.one", 1u, 2000u
-            ) != 0) {
-            usleep(500000u);
-            continue;
-        }
-        pthread_mutex_lock(&app->state_mutex);
-        while (atomic_load(&app->ping_worker_running) &&
-               app->ping_results == before) {
-            struct timespec duration = wlh_app_relative_duration_ms(3000u);
-            if (pthread_cond_timedwait_relative_np(
-                    &app->state_changed, &app->state_mutex, &duration
-                ) != 0)
-                break;
-        }
-        pthread_mutex_unlock(&app->state_mutex);
-    }
-    return NULL;
-}
-
-static int coexistence_wifi_up(app_t *app) {
-    static const uint8_t default_ssid[] = "WPA2Net";
-    static const uint8_t default_credential[] = "password123";
-    wlh_wifi_connect_params_t connect = {
-        app->ssid != NULL ? (const uint8_t *)app->ssid : default_ssid,
-        app->ssid != NULL ? strlen(app->ssid) : sizeof(default_ssid) - 1u,
-        app->credential != NULL ? (const uint8_t *)app->credential
-                                : default_credential,
-        app->credential != NULL ? strlen(app->credential)
-                                : sizeof(default_credential) - 1u,
-        4u,
-        10000u
-    };
-
-    app->completions = 0u;
-    (void)wlh_host_wifi_initialize(&app->host, completion, app);
-    if (!wlh_app_wait_until(app, one_completion, 3000u))
-        return -1;
-    (void)wlh_host_wifi_connect(&app->host, &connect, completion, app);
-    if (!wlh_app_wait_until(app, connected, 20000u)) {
-        WLH_LOGE("host-sim", "coexistence: Wi-Fi connect failed");
-        return -1;
-    }
-
-    atomic_store(&app->ping_worker_running, true);
-    if (pthread_create(&app->ping_thread, NULL, ping_worker, app) != 0)
-        return -1;
-    app->ping_thread_started = true;
-    pthread_mutex_lock(&app->state_mutex);
-    app->ping_target = 1u;
-    pthread_mutex_unlock(&app->state_mutex);
-    if (!wlh_app_wait_until(app, ping_target_reached, 30000u)) {
-        WLH_LOGE("host-sim", "coexistence: DHCP/DNS/ICMP health check failed");
-        return -1;
-    }
-    WLH_LOGI("host-sim", "coexistence: Wi-Fi up, health checks running");
-    return 0;
-}
-
-static int run_ble_scenario(app_t *app, const char *scenario) {
-    bool coexist = strcmp(scenario, "ble-coexistence") == 0;
-    int result = 0;
-
-    if (!wlh_app_wait_until(app, ready, 5000u))
-        return -1;
-
-    if (coexist && coexistence_wifi_up(app) != 0)
-        result = -1;
-
-    if (result == 0) {
-        result = wlh_ble_app_start(&app->host, &app->osal_ops, &app->ble) == 0
-                     ? (strcmp(scenario, "ble-peripheral") == 0
-                            ? wlh_ble_run_peripheral()
-                            : wlh_ble_run_central())
-                     : -1;
-        wlh_ble_app_stop();
-    }
-
-    if (coexist) {
-        if (result == 0) {
-            pthread_mutex_lock(&app->state_mutex);
-            if (app->disconnected) {
-                WLH_LOGE("host-sim", "coexistence: Wi-Fi dropped during BLE");
-                result = -1;
-            }
-            app->ping_target = app->ping_ok + 10u;
-            pthread_mutex_unlock(&app->state_mutex);
-            if (result == 0 &&
-                !wlh_app_wait_until(app, ping_target_reached, 60000u)) {
-                WLH_LOGE(
-                    "host-sim", "coexistence: post-BLE ping quota not met"
-                );
-                result = -1;
-            }
-        }
-        if (app->ping_thread_started) {
-            atomic_store(&app->ping_worker_running, false);
-            pthread_mutex_lock(&app->state_mutex);
-            pthread_cond_broadcast(&app->state_changed);
-            pthread_mutex_unlock(&app->state_mutex);
-            pthread_join(app->ping_thread, NULL);
-            app->ping_thread_started = false;
-        }
-        pthread_mutex_lock(&app->state_mutex);
-        app->disconnected = false;
-        pthread_mutex_unlock(&app->state_mutex);
-        (void)wlh_host_wifi_disconnect(&app->host, completion, app);
-        (void)wlh_app_wait_until(app, disconnected, 3000u);
-    }
-    return result;
-}
 
 static bool ota_begin_done(app_t *app) {
     return app->ota_begin_done;
@@ -1086,38 +888,41 @@ static bool ota_activate_finished_or_rebooting(app_t *app) {
     return app->ota_activate_done || app->ota_left_ready;
 }
 
-static int run_ota_scenario(app_t *app) {
+int wlh_app_run_ota(
+    app_t *app,
+    const char *image_path,
+    const char *expected_version,
+    uint32_t timeout_ms,
+    const char **fail_stage
+) {
     FILE *file;
     long file_size;
-    uint8_t *image;
+    uint8_t *image = NULL;
     size_t offset = 0u;
     wlh_host_ota_begin_params_t params;
-    uint32_t timeout = app->ota_timeout_ms == 0u ? 30000u : app->ota_timeout_ms;
-    if (!app->use_usb || app->ota_image == NULL) {
-        WLH_LOGE("host-sim", "OTA requires --usb and --ota-image");
-        return -1;
-    }
-    file = fopen(app->ota_image, "rb");
+    uint32_t timeout = timeout_ms == 0u ? 30000u : timeout_ms;
+    const char *stage = "read-image";
+    file = fopen(image_path, "rb");
     if (file == NULL || fseek(file, 0, SEEK_END) != 0 ||
         (file_size = ftell(file)) <= 0 || fseek(file, 0, SEEK_SET) != 0) {
         if (file != NULL)
             fclose(file);
-        return -1;
+        goto fail;
     }
     image = malloc((size_t)file_size);
     if (image == NULL ||
         fread(image, 1u, (size_t)file_size, file) != (size_t)file_size) {
-        free(image);
         fclose(file);
-        return -1;
+        goto fail;
     }
     fclose(file);
     memset(&params, 0, sizeof(params));
     params.image_size = (uint64_t)file_size;
     app->ota_image_size = (uint64_t)file_size;
-    params.target_version = app->ota_version;
+    params.target_version = expected_version;
     CC_SHA256(image, (CC_LONG)file_size, params.sha256);
     app->ota_query_done = false;
+    stage = "query";
     if (!wlh_app_wait_until(app, ready, 10000u) ||
         wlh_host_ota_query(&app->host, ota_query_completion, app) !=
             WLH_HOST_OK ||
@@ -1125,6 +930,7 @@ static int run_ota_scenario(app_t *app) {
         goto fail;
     if (app->ota_query.transfer_id != 0u) {
         app->completions = 0u;
+        stage = "abort-stale";
         if (wlh_host_ota_abort(
                 &app->host, app->ota_query.transfer_id, completion, app
             ) != WLH_HOST_OK ||
@@ -1132,11 +938,13 @@ static int run_ota_scenario(app_t *app) {
             goto fail;
     }
     app->ota_begin_done = false;
+    stage = "begin";
     if (wlh_host_ota_begin(&app->host, &params, ota_begin_completion, app) !=
             WLH_HOST_OK ||
         !wlh_app_wait_until(app, ota_begin_done, timeout) ||
         app->last_completion_result != WLH_HOST_OK)
         goto fail;
+    stage = "stream";
     while (offset < (size_t)file_size) {
         size_t chunk = app->ota_begin.stream_chunk_size;
         wlh_host_result_t result;
@@ -1165,6 +973,7 @@ static int run_ota_scenario(app_t *app) {
         offset += chunk;
     }
     app->completions = 0u;
+    stage = "finalize";
     if (wlh_host_ota_finalize(
             &app->host, app->ota_begin.transfer_id, offset, completion, app
         ) != WLH_HOST_OK ||
@@ -1172,6 +981,7 @@ static int run_ota_scenario(app_t *app) {
         goto fail;
     app->ota_activate_done = false;
     app->ota_left_ready = false;
+    stage = "activate";
     if (wlh_host_ota_activate(
             &app->host,
             app->ota_begin.transfer_id,
@@ -1183,148 +993,34 @@ static int run_ota_scenario(app_t *app) {
         goto fail;
     if (app->ota_activate_done && app->ota_activate_result != WLH_HOST_OK)
         goto fail;
+    stage = "reboot";
     if (!wlh_app_wait_until(app, not_ready, 10000u) ||
         !wlh_app_wait_until(app, ready, timeout))
         goto fail;
     app->ota_query_done = false;
+    stage = "verify-clean";
     if (wlh_host_ota_query(&app->host, ota_query_completion, app) !=
             WLH_HOST_OK ||
         !wlh_app_wait_until(app, ota_query_done, 5000u) ||
         app->last_completion_result != WLH_HOST_OK ||
         app->ota_query.transfer_id != 0u)
         goto fail;
-    if (app->ota_version != NULL &&
-        strcmp(wlh_host_get_peer_version(&app->host), app->ota_version) != 0)
+    stage = "verify-version";
+    if (expected_version != NULL &&
+        strcmp(wlh_host_get_peer_version(&app->host), expected_version) != 0)
         goto fail;
     free(image);
     return 0;
 fail:
     free(image);
+    if (fail_stage != NULL)
+        *fail_stage = stage;
     return -1;
-}
-
-static int run_scenario(app_t *app, const char *scenario) {
-    wlh_wifi_scan_params_t scan = {1u, NULL, 0u, true, 8u};
-    static const uint8_t default_ssid[] = "WPA2Net";
-    static const uint8_t default_credential[] = "password123";
-    static const uint8_t user_payload[] = "hello-coproc";
-    const uint8_t *ssid = default_ssid;
-    size_t ssid_size = sizeof(default_ssid) - 1u;
-    const uint8_t *credential = default_credential;
-    size_t credential_size = sizeof(default_credential) - 1u;
-    wlh_wifi_connect_params_t connect;
-    uint8_t ethernet[60] = {0x02, 0, 0, 0, 0, 2, 0x02, 0, 0, 0, 0, 1};
-
-    if (app->ssid != NULL) {
-        ssid = (const uint8_t *)app->ssid;
-        ssid_size = strlen(app->ssid);
-    }
-    if (app->credential != NULL) {
-        credential = (const uint8_t *)app->credential;
-        credential_size = strlen(app->credential);
-    }
-    connect = (wlh_wifi_connect_params_t){
-        ssid, ssid_size, credential, credential_size, 4u, 3000u
-    };
-
-    /* Managed mode owns its (longer) READY wait; skip the scenario gate. */
-    if (strcmp(scenario, "managed") == 0)
-        return run_managed(app);
-
-    /* The REPL performs its own READY handling per command. */
-    if (strcmp(scenario, "repl") == 0)
-        return wlh_repl_run(app);
-
-    if (strncmp(scenario, "ble-", 4u) == 0) {
-        if (!app->use_usb) {
-            WLH_LOGE(
-                "host-sim",
-                "BLE scenarios require --usb (HCI channel is not supported "
-                "over IPC)"
-            );
-            return -1;
-        }
-        return run_ble_scenario(app, scenario);
-    }
-
-    if (strcmp(scenario, "ota") == 0)
-        return run_ota_scenario(app);
-
-    if (!wlh_app_wait_until(app, ready, 5000u))
-        return -1;
-    if (strcmp(scenario, "smoke") == 0)
-        return 0;
-    if (strcmp(scenario, "recovery") == 0) {
-        wlh_host_transport_lost(&app->host);
-        if (!wlh_app_wait_until(app, not_ready, 2000u))
-            return -1;
-        return wlh_app_wait_until(app, ready, 5000u) ? 0 : -1;
-    }
-    if (strcmp(scenario, "services") == 0) {
-        (void)wlh_host_get_device_info(&app->host, device_info_completion, app);
-        if (!wlh_app_wait_until(app, device_info_ready, 3000u))
-            return -1;
-        if (app->device_info_result != WLH_HOST_OK)
-            return -1;
-        app->completions = 0u;
-        (void)wlh_host_user_message_send(
-            &app->host,
-            1u,
-            1u,
-            1u /* EXPECT_RESULT */,
-            user_payload,
-            sizeof(user_payload) - 1u,
-            completion,
-            app
-        );
-        if (!wlh_app_wait_until(app, one_completion, 3000u))
-            return -1;
-        /* A RESULT event is optional; give it a short window. */
-        (void)wlh_app_wait_until(app, user_result_arrived, 1500u);
-        return 0;
-    }
-
-    app->completions = 0u;
-    (void)wlh_host_wifi_initialize(&app->host, completion, app);
-    if (!wlh_app_wait_until(app, one_completion, 3000u))
-        return -1;
-
-    (void)wlh_host_wifi_scan(&app->host, &scan, completion, app);
-    if (!wlh_app_wait_until(app, scan_complete, 3000u))
-        return -1;
-    if (strcmp(scenario, "scan") == 0)
-        return 0;
-
-    (void)wlh_host_wifi_connect(&app->host, &connect, completion, app);
-    if (!wlh_app_wait_until(app, connected, 4000u))
-        return -1;
-
-    /* Ethernet echo is a mock-coprocessor behavior; a real device forwards
-       the frame to the AP instead, so USB mode skips the echo check. */
-    if (!app->use_usb) {
-        (void)wlh_host_ethernet_sta_send(
-            &app->host, ethernet, sizeof(ethernet)
-        );
-        if (!wlh_app_wait_until(app, ethernet_rx, 3000u))
-            return -1;
-    }
-
-    (void)wlh_host_wifi_disconnect(&app->host, completion, app);
-    return wlh_app_wait_until(app, disconnected, 3000u) ? 0 : -1;
 }
 
 static void usage(const char *program) {
     fprintf(
-        stderr,
-        "usage: %s --ipc connect:PATH|fd:N | --usb VID:PID [--scenario "
-        "smoke|scan|connect|recovery|services|managed|ota|repl|ble-central|"
-        "ble-peripheral|ble-coexistence] "
-        "[--monitor-interval-ms N] [--rpc-timeout-ms N] "
-        "[--ssid SSID] [--credential CREDENTIAL] "
-        "[--ble-bond-store PATH] [--ble-clear-bonds] "
-        "[--ble-io-cap no-io|display|keyboard|display-yes-no] "
-        "[--ble-passkey N] [--ble-peer-address ADDR] [--ble-timeout-ms N]\n",
-        program
+        stderr, "usage: %s --ipc connect:PATH|fd:N | --usb VID:PID\n", program
     );
 }
 
@@ -1349,7 +1045,6 @@ static bool parse_usb_ids(
 int main(int argc, char **argv) {
     app_t app;
     const char *endpoint = NULL;
-    const char *scenario = "connect";
     uint32_t rpc_timeout_ms = 3000u;
     wlh_host_config_t config;
     int index;
@@ -1357,7 +1052,6 @@ int main(int argc, char **argv) {
 
     memset(&app, 0, sizeof(app));
     app.monitor_interval_ms = 1000u;
-    app.ota_timeout_ms = 30000u;
     app.usb_config = (sim_usb_config_t){0x303au,
                                         0x8201u,
                                         0u,
@@ -1382,67 +1076,18 @@ int main(int argc, char **argv) {
                 usage(argv[0]);
                 return 2;
             }
-        } else if (strcmp(argv[index], "--ssid") == 0 && ++index < argc)
-            app.ssid = argv[index];
-        else if (strcmp(argv[index], "--credential") == 0 && ++index < argc)
-            app.credential = argv[index];
-        else if (strcmp(argv[index], "--scenario") == 0 && ++index < argc)
-            scenario = argv[index];
-        else if (strcmp(argv[index], "--monitor-interval-ms") == 0 &&
-                 ++index < argc)
-            app.monitor_interval_ms = (uint32_t)strtoul(argv[index], NULL, 10);
-        else if (strcmp(argv[index], "--rpc-timeout-ms") == 0 && ++index < argc)
-            rpc_timeout_ms = (uint32_t)strtoul(argv[index], NULL, 10);
-        else if (strcmp(argv[index], "--ota-image") == 0 && ++index < argc)
-            app.ota_image = argv[index];
-        else if (strcmp(argv[index], "--ota-version") == 0 && ++index < argc)
-            app.ota_version = argv[index];
-        else if (strcmp(argv[index], "--ota-timeout-ms") == 0 && ++index < argc)
-            app.ota_timeout_ms = (uint32_t)strtoul(argv[index], NULL, 10);
-        else if (strcmp(argv[index], "--ble-bond-store") == 0 && ++index < argc)
-            app.ble.bond_store_path = argv[index];
-        else if (strcmp(argv[index], "--ble-clear-bonds") == 0)
-            app.ble.clear_bonds = true;
-        else if (strcmp(argv[index], "--ble-io-cap") == 0 && ++index < argc) {
-            if (strcmp(argv[index], "no-io") == 0)
-                app.ble.io_cap = WLH_BLE_IO_CAP_NO_IO;
-            else if (strcmp(argv[index], "display") == 0)
-                app.ble.io_cap = WLH_BLE_IO_CAP_DISPLAY;
-            else if (strcmp(argv[index], "keyboard") == 0)
-                app.ble.io_cap = WLH_BLE_IO_CAP_KEYBOARD;
-            else if (strcmp(argv[index], "display-yes-no") == 0)
-                app.ble.io_cap = WLH_BLE_IO_CAP_DISPLAY_YES_NO;
-            else {
-                usage(argv[0]);
-                return 2;
-            }
-        } else if (strcmp(argv[index], "--ble-passkey") == 0 &&
-                   ++index < argc) {
-            char *end;
-            unsigned long value = strtoul(argv[index], &end, 10);
-            if (end == argv[index] || *end != '\0' || value > 999999ul) {
-                usage(argv[0]);
-                return 2;
-            }
-            app.ble.passkey = (uint32_t)value;
-            app.ble.have_passkey = true;
-        } else if (strcmp(argv[index], "--ble-peer-address") == 0 &&
-                   ++index < argc)
-            app.ble.peer_address = argv[index];
-        else if (strcmp(argv[index], "--ble-timeout-ms") == 0 && ++index < argc)
-            app.ble.timeout_ms = (uint32_t)strtoul(argv[index], NULL, 10);
-        else {
+        } else {
             usage(argv[0]);
             return 2;
         }
     }
-    if ((endpoint == NULL) == !app.use_usb || app.monitor_interval_ms == 0u) {
+    if ((endpoint == NULL) == !app.use_usb) {
         usage(argv[0]);
         return 2;
     }
     /* Arm the REPL before wlh_host_start so the first READY state change is
      * already emitted as a JSON event line. */
-    app.repl.active = strcmp(scenario, "repl") == 0;
+    app.repl.active = true;
 
     signal(SIGINT, signal_handler);
     signal(SIGTERM, signal_handler);
@@ -1453,8 +1098,7 @@ int main(int argc, char **argv) {
     WLH_LOG_INIT();
     WLH_LOGI(
         "host-sim",
-        "starting scenario=%s endpoint=%s usb=%s rpc_timeout_ms=%u",
-        scenario,
+        "starting endpoint=%s usb=%s rpc_timeout_ms=%u",
         app.use_usb ? "usb" : endpoint,
         app.use_usb ? "yes" : "no",
         rpc_timeout_ms
@@ -1524,7 +1168,7 @@ int main(int argc, char **argv) {
     result = wlh_host_start(&app.host);
 
     if (result == WLH_HOST_OK)
-        result = run_scenario(&app, scenario);
+        result = wlh_repl_run(&app);
     send_runtime(&app);
 
     wlh_iperf_controller_destroy(app.iperf);

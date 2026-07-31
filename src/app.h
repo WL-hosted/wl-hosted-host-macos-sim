@@ -11,7 +11,6 @@
 #include <stdint.h>
 #include <time.h>
 
-#include "ble/ble_app.h"
 #include "wlh/host.h"
 #include "wlh/posix_osal.h"
 #include <wifi.pb.h>
@@ -53,11 +52,6 @@ typedef struct app {
     bool use_usb;
     sim_usb_config_t usb_config;
     sim_usb_transport_t *usb;
-    const char *ssid;
-    const char *credential;
-    const char *ota_image;
-    const char *ota_version;
-    uint32_t ota_timeout_ms;
     uint64_t ota_image_size;
 
     pthread_t rx_thread;
@@ -81,21 +75,12 @@ typedef struct app {
     bool connected;
     bool disconnected;
     bool ethernet_rx;
-    bool device_info_done;
-    wlh_host_result_t device_info_result;
     bool user_result_received;
 
     uint64_t started_ms;
     uint32_t monitor_interval_ms;
 
     wlh_osal_ops_t osal_ops;
-    wlh_ble_options_t ble;
-    pthread_t ping_thread;
-    bool ping_thread_started;
-    atomic_bool ping_worker_running;
-    unsigned ping_results;
-    unsigned ping_ok;
-    unsigned ping_target;
 
     app_repl_t repl;
     wlh_iperf_controller_t *iperf;
@@ -110,6 +95,18 @@ bool wlh_app_interrupted(void);
  * info while waiting. Returns the final predicate value. */
 bool wlh_app_wait_until(
     app_t *app, bool (*predicate)(app_t *), uint32_t timeout_ms
+);
+
+/* Runs the full OTA flow (query/abort-stale, begin, stream, finalize,
+ * activate, reboot wait, version verify). Blocks the calling thread.
+ * expected_version NULL skips verification; timeout_ms 0 selects 30000.
+ * On failure *fail_stage (optional) names the failing step. */
+int wlh_app_run_ota(
+    app_t *app,
+    const char *image_path,
+    const char *expected_version,
+    uint32_t timeout_ms,
+    const char **fail_stage
 );
 
 const char *wlh_app_wifi_security_name(wlh_protocol_v1_WifiSecurity security);

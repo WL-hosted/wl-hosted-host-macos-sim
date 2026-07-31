@@ -1,5 +1,6 @@
 #include "repl.h"
 
+#include "ble/ble_app.h"
 #include "iperf_controller.h"
 #include "network.h"
 #include "repl_json.h"
@@ -17,6 +18,7 @@
 #include <string.h>
 #include <strings.h>
 #include <termios.h>
+#include <time.h>
 #include <unistd.h>
 
 #define REPL_MODE_IPC 0x01u
@@ -24,7 +26,7 @@
 #define REPL_MODE_ANY (REPL_MODE_IPC | REPL_MODE_USB)
 
 #define REPL_MAX_LINE 4096u
-#define REPL_MAX_TOKENS 8u
+#define REPL_MAX_TOKENS 12u
 #define REPL_PING_ID_BASE 0x60000000u
 #define REPL_PING_ID_MASK 0xf0000000u
 
@@ -636,10 +638,11 @@ static int cmd_ping(app_t *app, int argc, char **argv, bool *quit) {
 }
 
 static int cmd_ble(app_t *app, int argc, char **argv, bool *quit) {
+    wlh_ble_options_t options = {0};
     bool peripheral;
     int run_result;
     cJSON *doc;
-    (void)argc;
+    int index;
     (void)quit;
     if (strcmp(argv[1], "central") == 0)
         peripheral = false;
@@ -654,6 +657,72 @@ static int cmd_ble(app_t *app, int argc, char **argv, bool *quit) {
         );
         return WLH_HOST_INVALID_ARGUMENT;
     }
+    for (index = 2; index < argc; ++index) {
+        const char *arg = argv[index];
+        if (strncmp(arg, "peer=", 5u) == 0) {
+            if (peripheral) {
+                emit_error(
+                    app,
+                    argv[0],
+                    WLH_HOST_INVALID_ARGUMENT,
+                    "peer= is only valid for the central role"
+                );
+                return WLH_HOST_INVALID_ARGUMENT;
+            }
+            options.peer_address = arg + 5;
+        } else if (strncmp(arg, "passkey=", 8u) == 0) {
+            uint32_t passkey;
+            if (!parse_u32(arg + 8, 0u, 999999u, &passkey)) {
+                emit_error(
+                    app,
+                    argv[0],
+                    WLH_HOST_INVALID_ARGUMENT,
+                    "passkey must be 0-999999"
+                );
+                return WLH_HOST_INVALID_ARGUMENT;
+            }
+            options.passkey = passkey;
+            options.have_passkey = true;
+        } else if (strncmp(arg, "io-cap=", 7u) == 0) {
+            const char *cap = arg + 7;
+            if (strcmp(cap, "no-io") == 0)
+                options.io_cap = WLH_BLE_IO_CAP_NO_IO;
+            else if (strcmp(cap, "display") == 0)
+                options.io_cap = WLH_BLE_IO_CAP_DISPLAY;
+            else if (strcmp(cap, "keyboard") == 0)
+                options.io_cap = WLH_BLE_IO_CAP_KEYBOARD;
+            else if (strcmp(cap, "display-yes-no") == 0)
+                options.io_cap = WLH_BLE_IO_CAP_DISPLAY_YES_NO;
+            else {
+                emit_error(
+                    app,
+                    argv[0],
+                    WLH_HOST_INVALID_ARGUMENT,
+                    "io-cap must be no-io|display|keyboard|display-yes-no"
+                );
+                return WLH_HOST_INVALID_ARGUMENT;
+            }
+        } else if (strncmp(arg, "bond-store=", 11u) == 0) {
+            options.bond_store_path = arg + 11;
+        } else if (strcmp(arg, "clear-bonds") == 0) {
+            options.clear_bonds = true;
+        } else if (strncmp(arg, "timeout-ms=", 11u) == 0) {
+            if (!parse_u32(arg + 11, 1u, 3600000u, &options.timeout_ms)) {
+                emit_error(
+                    app,
+                    argv[0],
+                    WLH_HOST_INVALID_ARGUMENT,
+                    "timeout-ms must be 1-3600000"
+                );
+                return WLH_HOST_INVALID_ARGUMENT;
+            }
+        } else {
+            emit_error(
+                app, argv[0], WLH_HOST_INVALID_ARGUMENT, "unknown ble option"
+            );
+            return WLH_HOST_INVALID_ARGUMENT;
+        }
+    }
     if (!wlh_app_wait_until(app, host_ready, 5000u)) {
         emit_error(app, argv[0], WLH_HOST_TIMEOUT, "host session not READY");
         return WLH_HOST_TIMEOUT;
@@ -664,7 +733,7 @@ static int cmd_ble(app_t *app, int argc, char **argv, bool *quit) {
             doc, "role", peripheral ? "peripheral" : "central"
         );
     wlh_repl_json_emit(doc);
-    if (wlh_ble_app_start(&app->host, &app->osal_ops, &app->ble) != 0) {
+    if (wlh_ble_app_start(&app->host, &app->osal_ops, &options) != 0) {
         wlh_ble_app_stop();
         emit_error(app, argv[0], WLH_HOST_INVALID_STATE, "BLE start failed");
         return WLH_HOST_INVALID_STATE;
@@ -675,6 +744,87 @@ static int cmd_ble(app_t *app, int argc, char **argv, bool *quit) {
         emit_error(app, argv[0], WLH_HOST_PROTOCOL_ERROR, "BLE run failed");
         return WLH_HOST_PROTOCOL_ERROR;
     }
+    return WLH_HOST_OK;
+}
+
+static int cmd_ota(app_t *app, int argc, char **argv, bool *quit) {
+    uint32_t timeout_ms = 0u;
+    const char *stage = "unknown";
+    (void)quit;
+    if (argc > 3 && !parse_u32(argv[3], 1u, 3600000u, &timeout_ms)) {
+        emit_error(
+            app,
+            argv[0],
+            WLH_HOST_INVALID_ARGUMENT,
+            "timeout_ms must be 1-3600000"
+        );
+        return WLH_HOST_INVALID_ARGUMENT;
+    }
+    if (wlh_app_run_ota(
+            app, argv[1], argc > 2 ? argv[2] : NULL, timeout_ms, &stage
+        ) != 0) {
+        emit_error(app, argv[0], WLH_HOST_PROTOCOL_ERROR, stage);
+        return WLH_HOST_PROTOCOL_ERROR;
+    }
+    return WLH_HOST_OK;
+}
+
+static int cmd_monitor_interval(app_t *app, int argc, char **argv, bool *quit) {
+    uint32_t interval_ms;
+    (void)argc;
+    (void)quit;
+    if (!parse_u32(argv[1], 1u, 3600000u, &interval_ms)) {
+        emit_error(
+            app, argv[0], WLH_HOST_INVALID_ARGUMENT, "ms must be 1-3600000"
+        );
+        return WLH_HOST_INVALID_ARGUMENT;
+    }
+    app->monitor_interval_ms = interval_ms;
+    return WLH_HOST_OK;
+}
+
+static int cmd_rpc_timeout(app_t *app, int argc, char **argv, bool *quit) {
+    uint32_t timeout_ms;
+    (void)argc;
+    (void)quit;
+    if (!parse_u32(argv[1], 1u, 600000u, &timeout_ms)) {
+        emit_error(
+            app, argv[0], WLH_HOST_INVALID_ARGUMENT, "ms must be 1-600000"
+        );
+        return WLH_HOST_INVALID_ARGUMENT;
+    }
+    /* Consumed at RPC enqueue on the Core executor thread; every RPC this
+     * serialized REPL submits afterwards is ordered through the executor
+     * queue mutex, which provides the required happens-before. */
+    app->host.config.rpc_timeout_ms = timeout_ms;
+    return WLH_HOST_OK;
+}
+
+static int cmd_sleep(app_t *app, int argc, char **argv, bool *quit) {
+    char *end = NULL;
+    double seconds;
+    struct timespec duration;
+    (void)argc;
+    (void)quit;
+    errno = 0;
+    seconds = strtod(argv[1], &end);
+    if (errno != 0 || end == argv[1] || *end != '\0' || !(seconds > 0.0) ||
+        seconds > 86400.0) {
+        emit_error(
+            app,
+            argv[0],
+            WLH_HOST_INVALID_ARGUMENT,
+            "seconds must be in (0, 86400], decimals allowed"
+        );
+        return WLH_HOST_INVALID_ARGUMENT;
+    }
+    duration.tv_sec = (time_t)seconds;
+    duration.tv_nsec = (long)((seconds - (double)duration.tv_sec) * 1e9);
+    if (duration.tv_nsec > 999999999L)
+        duration.tv_nsec = 999999999L;
+    while (nanosleep(&duration, &duration) != 0 && errno == EINTR &&
+           !wlh_app_interrupted())
+        ;
     return WLH_HOST_OK;
 }
 
@@ -739,10 +889,19 @@ static const repl_command_t commands[] = {
      "ping <host> [count] [timeout_ms] - ICMP ping over the STA link"},
     {"ble",
      1,
-     1,
+     7,
      REPL_MODE_USB,
      cmd_ble,
-     "ble central|peripheral - run the BLE scenario (blocks until done)"},
+     "ble central|peripheral [peer=ADDR] [passkey=N] "
+     "[io-cap=no-io|display|keyboard|display-yes-no] [bond-store=PATH] "
+     "[clear-bonds] [timeout-ms=N] - run the BLE flow (blocks until done)"},
+    {"ota",
+     1,
+     3,
+     REPL_MODE_USB,
+     cmd_ota,
+     "ota <image-path> [expected-version] [timeout_ms] - full OTA flow "
+     "(blocks; timeout_ms requires expected-version)"},
     {"iperf",
      2,
      5,
@@ -750,6 +909,24 @@ static const repl_command_t commands[] = {
      cmd_iperf,
      "iperf tcp client <IPv4> [duration_sec] | tcp server [duration_sec] | udp "
      "client <IPv4> [duration_sec] [mbps] | udp server [duration_sec]"},
+    {"monitor-interval",
+     1,
+     1,
+     REPL_MODE_ANY,
+     cmd_monitor_interval,
+     "monitor-interval <ms> - sideband runtime report period"},
+    {"rpc-timeout",
+     1,
+     1,
+     REPL_MODE_ANY,
+     cmd_rpc_timeout,
+     "rpc-timeout <ms> - default timeout for subsequent RPCs"},
+    {"sleep",
+     1,
+     1,
+     REPL_MODE_ANY,
+     cmd_sleep,
+     "sleep <seconds> - pause command processing (decimals allowed)"},
     {"help", 0, 0, REPL_MODE_ANY, cmd_help, "help - list commands"},
     {"quit", 0, 0, REPL_MODE_ANY, cmd_quit, "quit - exit the REPL"},
     {"exit", 0, 0, REPL_MODE_ANY, cmd_quit, "exit - exit the REPL"},
@@ -889,6 +1066,30 @@ static void dispatch_line(app_t *app, char *line, bool *quit) {
         cJSON_AddNumberToObject(doc, "result", result);
     }
     wlh_repl_json_emit(doc);
+}
+
+/* Splits the line in place on unquoted ';' and '\n' and dispatches each
+ * segment. Double quotes suppress splitting; an unterminated quote leaves
+ * the remainder as one segment, where tokenize() reports the error. Stops
+ * early when a segment quits. */
+static void dispatch_segments(app_t *app, char *line, bool *quit) {
+    char *segment = line;
+    char *cursor = line;
+    bool in_quotes = false;
+    for (;;) {
+        char character = *cursor;
+        if (character == '"')
+            in_quotes = !in_quotes;
+        if (character == '\0' ||
+            (!in_quotes && (character == ';' || character == '\n'))) {
+            *cursor = '\0';
+            dispatch_line(app, segment, quit);
+            if (character == '\0' || *quit)
+                return;
+            segment = cursor + 1;
+        }
+        ++cursor;
+    }
 }
 
 /* ---- stdin reader thread ------------------------------------------------- */
@@ -1061,7 +1262,7 @@ int wlh_repl_run(app_t *app) {
             }
             continue;
         }
-        dispatch_line(app, line, &quit);
+        dispatch_segments(app, line, &quit);
         free(line);
         if (quit) {
             reason = "quit";

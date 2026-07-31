@@ -1,6 +1,6 @@
 # WL-hosted Host macOS Simulator
 
-`wl-hosted-host-macos-sim` 是 WL-hosted 协议栈在 macOS 上的 Host 端模拟器。它基于 POSIX 线程、条件变量和单调时钟，把平台相关的部分适配到 WL-hosted Host Core，并提供场景化（scenario）运行器，用于在桌面端验证 Host Core 的链路建立、Wi-Fi 扫描、连接、Ethernet 透传、服务调用以及故障恢复等行为。
+`wl-hosted-host-macos-sim` 是 WL-hosted 协议栈在 macOS 上的 Host 端模拟器。它基于 POSIX 线程、条件变量和单调时钟，把平台相关的部分适配到 WL-hosted Host Core。程序启动后总是进入交互式 JSON Lines REPL（详见 §6），用于在桌面端验证 Host Core 的链路建立、Wi-Fi 扫描、连接、Ethernet 透传、服务调用、OTA、BLE 以及故障恢复等行为。
 
 本仓库仅包含 macOS/POSIX 适配层与可执行程序，平台无关的核心逻辑位于 `core/host-core`；`core/` 是 `wl-hosted-core` 单一子模块。
 
@@ -98,7 +98,7 @@ ctest --test-dir build-asan --output-on-failure
 通过 Unix domain socket 连接到 Manager 或另一端的 Coproc Sim，传输带 record 层的 Simulator IPC 帧，同时可上报运行时信息并接受故障注入。
 
 ```sh
-./build-debug/wlh-host-macos-sim --ipc connect:/path/to/host.sock --scenario connect
+./build-debug/wlh-host-macos-sim --ipc connect:/path/to/host.sock
 ```
 
 `--ipc` 支持两种 endpoint 形式：
@@ -111,8 +111,7 @@ ctest --test-dir build-asan --output-on-failure
 直接通过 libusb 连接符合 `espressif.esp32s3.coreboard.usb-wifi` 配置文件的 ESP32-S3 Coprocessor，传输原始 WL-hosted wire 帧，不经过 Simulator IPC record 层，也不启用 sideband。
 
 ```sh
-./build-debug/wlh-host-macos-sim --usb 303A:8201 --scenario connect \
-    --ssid MyAp --credential MyPassphrase
+./build-debug/wlh-host-macos-sim --usb 303A:8201
 ```
 
 默认 VID:PID 为 `303A:8201`。USB 模式下：
@@ -120,7 +119,7 @@ ctest --test-dir build-asan --output-on-failure
 - Bulk OUT 用于 Host -> Coprocessor，Bulk IN 用于 Coprocessor -> Host。
 - 帧边界由 24 字节 wire header 决定，而不是 USB packet 边界。
 - 检测到总线断开时会调用 `wlh_host_transport_lost`，由 Core 执行停止、有限重连等待、重新启动并重新协商 Hello 的恢复流程。
-- Ethernet echo 步骤会被跳过，因为真实设备会把帧转发到 AP，而不是回环 echo。
+- REPL 的 `eth-echo` 命令不可用（返回 NOT_SUPPORTED），因为真实设备会把帧转发到 AP，而不是回环 echo。
 
 ## 5. 命令行参数
 
@@ -130,72 +129,36 @@ ctest --test-dir build-asan --output-on-failure
 
 --usb VID:PID
     指定 USB 后端 VID:PID（十六进制）。与 --ipc 二选一。
-
---scenario smoke|scan|connect|recovery|services|managed|ota|repl|ble-central|ble-peripheral|ble-coexistence
-    指定运行场景，默认 connect。managed 仅适用于 IPC 模式；ble-* 仅适用于
-    USB 模式（HCI 通道不经 IPC 承载）；repl 两种模式均可用。
-
---monitor-interval-ms N
-    设置 sideband 运行时信息上报间隔，单位毫秒，默认 1000。
-
---rpc-timeout-ms N
-    设置 Host Core 的 RPC 超时时间，单位毫秒，默认 3000。
-
---ssid SSID
-    指定 Wi-Fi 连接使用的 SSID，默认 WPA2Net。
-
---credential CREDENTIAL
-    指定 Wi-Fi 连接使用的密码/凭据，默认 password123。
-
---ble-bond-store PATH
-    指定 BLE bond（配对密钥）持久化文件路径。默认为
-    ~/Library/Application Support/WL-hosted/bonds.bin（通过 getpwuid 解析
-    home 目录，不依赖 $HOME）。文件权限 0600，写入采用临时文件 + fsync + rename。
-
---ble-clear-bonds
-    启动时清除已保存的有效 bond（以及临时文件），随后从空 bond 存储开始。
-    不会删除无法识别版本的备份文件。
-
---ble-io-cap no-io|display|keyboard|display-yes-no
-    指定 BLE 配对时本机的 IO 能力，默认 no-io（Just Works，适合自动化）。
-
---ble-passkey N
-    指定 6 位数字 passkey（000000-999999），用于需要输入 passkey 的配对。
-
---ble-peer-address ADDR
-    指定要连接的对端地址，形如 public:AA:BB:CC:DD:EE:FF 或
-    random:AA:BB:CC:DD:EE:FF。未指定时按测试服务 UUID / 设备名扫描匹配。
-
---ble-timeout-ms N
-    覆盖 BLE 场景中各步骤的等待超时，单位毫秒。
 ```
 
-## 6. 内置场景说明
+其余全部能力（Wi-Fi 连接、OTA、BLE、监控/超时调整等）都通过 REPL 命令提供，
+见 §6。
 
-除 `managed` 与 `repl` 自行管理 READY 等待外，其余场景都会先等待 Host Core 进入 `READY` 状态（Hello 协商完成）。
+## 6. REPL
 
-| 场景 | 行为 |
-|------|------|
-| `smoke` | 仅验证链路可达并进入 READY，不做任何 RPC。 |
-| `recovery` | 在 READY 后人为触发 `wlh_host_transport_lost`，验证 Core 能在 2 秒内离开 READY，并在 5 秒内重新恢复 READY。 |
-| `scan` | 初始化 Wi-Fi，执行一次 BSS 扫描，等待 `WLH_HOST_EVENT_WIFI_SCAN_COMPLETED` 事件。 |
-| `connect` | 在 `scan` 的基础上，使用 `--ssid`/`--credential` 连接指定 AP，等待 `WLH_HOST_EVENT_WIFI_CONNECTED`，发送 Ethernet echo 帧并等待 `WLH_HOST_EVENT_ETHERNET_STA_RX`，最后断开并等待 `WLH_HOST_EVENT_WIFI_DISCONNECTED`。 |
-| `services` | 调用 Device Information 服务获取厂商/板级/UID 信息，并发送一条 User Passthrough 消息等待 completion；还会短暂等待可选的 `USER_MESSAGE_RESULT` 事件。 |
-| `managed` | Manager 驱动模式：等待 READY 后自动执行一次 Wi-Fi INITIALIZE（对端已初始化时容忍失败），随后长期驻留，通过 sideband 接收 Manager 下发的 `SIM_RECORD_WIFI_COMMAND`（scan / connect / disconnect / start_ap / stop_ap）并转换为标准 Wi-Fi RPC；也可接收 `SIM_RECORD_PING_COMMAND`，由 `NO_SYS=0` lwIP 通过 STA Ethernet 数据面完成 DHCP、DNS 和 ICMP ping 并返回 `SIM_RECORD_PING_RESULT`。链路断开后自动重新等待 READY 并重新 INITIALIZE，直到收到退出信号。仅 IPC + sideband 模式有效；USB `--usb` 独立运行模式行为不变。 |
-| `repl` | 交互式 REPL：从 stdin 逐行读取命令，stdout 输出 JSON Lines（详见 §6.1）。IPC 与 USB 模式均可用；每条命令自行等待 READY，链路断开时 REPL 存活，异步 state 事件反映恢复过程。 |
-| `ble-central` | 仅 USB。启动 NimBLE Host（GET_INFO → INITIALIZE(HCI) → ENABLE(LE) → NPL/pools → host task → sync），扫描（或直连 `--ble-peer-address`）测试对端，建立连接并发起 LE Secure Connections 配对，发现测试服务/特征/CCCD，订阅通知，写入 `ping`，验证收到 `pong` 通知并读取校验为 `pong`，最后断开。第二次运行会复用已持久化的 bond 直接加密，无需重新配对。 |
-| `ble-peripheral` | 仅 USB。以测试服务广播为 peripheral，接受中心设备连接与配对，处理 `ping`/`pong` GATT 事务并发送通知；对端断开后继续广播，等待下一次连接。 |
-| `ble-coexistence` | 仅 USB。先完成 WPA2 连接与 DHCP，并启动对 `one.one.one.one` 的持续 DNS/ICMP 健康检查；在 Wi-Fi 保持连接的同时执行完整的 ble-central 事务；BLE 结束后 Wi-Fi 仍须在线且再完成 ≥10 次 ping，验证 BLE 与 Wi-Fi 数据面并发共存。 |
+程序启动后总是进入交互式 REPL；每条命令自行等待 READY（Hello 协商完成），
+链路断开时 REPL 存活，异步 `state` 事件反映恢复过程。
+
+IPC 模式下 sideband 行为与命令无关且始终在线：周期性上报
+`SIM_RECORD_RUNTIME_INFO`（§8），接受 `SIM_RECORD_FAULT_REQUEST` 故障注入
+（§9），并处理 Manager 下发的 `SIM_RECORD_WIFI_COMMAND`（scan / connect /
+disconnect / start_ap / stop_ap，转换为标准 Wi-Fi RPC）与
+`SIM_RECORD_PING_COMMAND`（由 `NO_SYS=0` lwIP 通过 STA Ethernet 数据面完成
+DHCP、DNS 和 ICMP ping，返回 `SIM_RECORD_PING_RESULT`）。这些 sideband 处理
+与 REPL 命令并发运行。
 
 ### 6.1 REPL JSON Lines 契约
 
-`--scenario repl` 从 stdin 逐行读取命令，stdout 只输出 JSON Lines：每行一个
+REPL 从 stdin 逐行读取命令，stdout 只输出 JSON Lines：每行一个
 JSON 对象，固定携带 `"source":"wlh-host-sim"` 与 `"event"` 字段；日志全部走
 stderr，stdout 可直接接管道逐行 `json.loads`。TTY 下由 linenoise 提供
 `wlh> ` 提示符、行编辑与历史（上箭头），Ctrl-C/Ctrl-D 干净退出；管道（非
 TTY）输入时无提示符，读到 EOF 后自然退出。
 
-命令（参数含空格时用双引号包裹；`user-message` 取命令名后的原始剩余文本）：
+命令（参数含空格时用双引号包裹；`user-message` 取命令名后的原始剩余文本）。
+一行可包含多条命令，用 `;` 或 `\n` 分隔，双引号内的分隔符不生效；命令按顺序
+串行执行，`quit`/`exit` 之后的剩余段不再执行。注意 `user-message` 的剩余文本
+也止于首个不在引号内的 `;`。
 
 | 命令 | 模式 | 说明 |
 |------|------|------|
@@ -211,7 +174,11 @@ TTY）输入时无提示符，读到 EOF 后自然退出。
 | `iperf tcp server [duration_sec]` | 两者 | Host Sim TCP 接收 Mac iPerf2 client。 |
 | `iperf udp client <IPv4> [duration_sec] [mbps]` | 两者 | Host Sim 按 iPerf2 UDP 格式发送（默认 30 秒、20 Mbps）。 |
 | `iperf udp server [duration_sec]` | 两者 | Host Sim 接收 iPerf2 UDP 并报告丢包、乱序和 jitter。 |
-| `ble central\|peripheral` | 仅 USB | 同步运行完整 BLE 场景（阻塞至结束），选项沿用 `--ble-*` 参数。 |
+| `ota <image-path> [expected-version] [timeout_ms]` | 仅 USB | 运行完整 OTA 流程：QUERY → 清理残留 → BEGIN → 流式传输（credit 反压）→ FINALIZE（SHA-256）→ ACTIVATE → 等待重启恢复 READY → 复查 QUERY；给出 expected-version 时校验新固件版本。timeout 为位置参数，指定时必须同时给 expected-version；默认 30000ms。失败时 error 行的 `detail` 为失败阶段（如 `begin`、`stream`、`verify-version`）。 |
+| `ble central\|peripheral [选项…]` | 仅 USB | 同步运行完整 BLE 流程（阻塞至结束）。选项为 `key=value` 形式：`peer=[public:\|random:]AA:BB:CC:DD:EE:FF`（仅 central；未指定时按测试服务 UUID / 设备名扫描匹配）、`passkey=N`（000000-999999）、`io-cap=no-io\|display\|keyboard\|display-yes-no`（默认 no-io，Just Works）、`bond-store=PATH`（bond 持久化文件，默认 `~/Library/Application Support/WL-hosted/bonds.bin`，经 getpwuid 解析、不依赖 $HOME；权限 0600，写入采用临时文件 + fsync + rename）、`clear-bonds`（先清除有效 bond 与临时文件，不删除无法识别版本的备份）、`timeout-ms=N`（各步骤等待超时）。 |
+| `monitor-interval <ms>` | 两者 | 设置 sideband 运行时信息上报间隔（1-3600000ms，默认 1000）。 |
+| `rpc-timeout <ms>` | 两者 | 设置 Host Core 的 RPC 超时（1-600000ms，默认 3000），对后续 RPC 生效。 |
+| `sleep <seconds>` | 两者 | 阻塞指定秒数，支持小数（如 `sleep 1.5`），上限 86400。 |
 | `help` / `quit` / `exit` | 两者 | 列出命令 / 退出。 |
 
 事件流：命令结束输出 `{"event":"result","command":"…","result":N}`（N 为
@@ -237,8 +204,8 @@ server。四项手工验证矩阵为：`iperf -s -i 3` + `iperf tcp client <mac-
 管道驱动示例：
 
 ```sh
-printf 'scan\nconnect WPA2Net password123\neth-echo\nping one.one.one.one\ndisconnect\nquit\n' \
-  | ./build-debug/wlh-host-macos-sim --ipc connect:/tmp/host.sock --scenario repl 2>/dev/null
+echo 'scan; connect WPA2Net password123; eth-echo; ping one.one.one.one; sleep 1.5; disconnect; quit' \
+  | ./build-debug/wlh-host-macos-sim --ipc connect:/tmp/host.sock 2>/dev/null
 ```
 
 已知限制：TTY 交互中异步事件行可能与正在编辑的行交错；管道驱动的自动化场景
@@ -249,13 +216,13 @@ printf 'scan\nconnect WPA2Net password123\neth-echo\nping one.one.one.one\ndisco
 本仓库把 Host Core 所需的 OSAL、buffer、executor、transport 四类操作以 C 结构体回调形式注入：
 
 - **OSAL**：启用 Common 提供的 `wlh_posix_osal`，包含互斥锁、条件变量、单调时钟定时器。
-- **Buffer**：由主程序分配/释放，支持通过 `--fail-allocations`（内部测试钩子）模拟分配失败。
+- **Buffer**：由主程序分配/释放，可经 sideband `BUFFER_OOM` 故障注入（§9）模拟分配失败。
 - **Executor**：`sim_executor_t` 是一个 64 槽有界单线程任务队列，用于执行 Core 提交的工作项。
 - **Transport**：生命周期与发送操作都异步提交到独立的 TX executor，避免在 Core 回调上下文中阻塞或执行 I/O。
 
 线程分布：
 
-- 主线程：初始化、启动 Host Core、运行 scenario 逻辑、条件变量等待状态变化。
+- 主线程：初始化、启动 Host Core、运行 REPL 循环、条件变量等待状态变化。
 - TX executor 线程：执行 transport 的 start/stop 与 frame 发送。
 - RX 线程：IPC 模式下读取 IPC record，解析为标准帧或 sideband 故障请求后提交给 Core；USB 模式下由 `transport_usb.c` 内部维护独立的 bulk IN 接收线程。
 
