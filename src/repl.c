@@ -342,6 +342,7 @@ static const char *state_name(wlh_host_state_t state) {
 static int cmd_status(app_t *app, int argc, char **argv, bool *quit) {
     wlh_host_diagnostics_t diagnostics;
     bool is_connected;
+    bool eth_link_up;
     char ipv4[16] = {0};
     cJSON *doc;
     (void)argc;
@@ -350,6 +351,7 @@ static int cmd_status(app_t *app, int argc, char **argv, bool *quit) {
     wlh_host_get_diagnostics(&app->host, &diagnostics);
     pthread_mutex_lock(&app->state_mutex);
     is_connected = app->connected && !app->disconnected;
+    eth_link_up = app->eth_link_up;
     pthread_mutex_unlock(&app->state_mutex);
     doc = wlh_repl_json_begin("status");
     if (doc != NULL) {
@@ -368,6 +370,11 @@ static int cmd_status(app_t *app, int argc, char **argv, bool *quit) {
             doc, "eth_queue_full", diagnostics.ethernet_queue_full
         );
         cJSON_AddBoolToObject(doc, "wifi_connected", is_connected);
+        /* Wired-ETH peers: eth_mode reports probe success, eth_link the last
+         * known link state. Wi-Fi-only firmware keeps eth_mode=false and
+         * eth_link="down". */
+        cJSON_AddBoolToObject(doc, "eth_mode", atomic_load(&app->eth_mode));
+        cJSON_AddStringToObject(doc, "eth_link", eth_link_up ? "up" : "down");
         if (sim_network_ipv4(app->network, ipv4))
             cJSON_AddStringToObject(doc, "dhcp_ipv4", ipv4);
         cJSON_AddStringToObject(
@@ -1360,6 +1367,22 @@ void wlh_repl_on_host_event(app_t *app, const wlh_host_event_t *event) {
         break;
     case WLH_HOST_EVENT_WIFI_DISCONNECTED:
         wlh_repl_json_emit(wlh_repl_json_begin("wifi_disconnected"));
+        break;
+    case WLH_HOST_EVENT_ETH_LINK_STATE_CHANGED:
+        doc = wlh_repl_json_begin("eth_link");
+        if (doc != NULL &&
+            event->payload_size >= sizeof(wlh_host_eth_link_state_event_t)) {
+            wlh_host_eth_link_state_event_t change;
+            memcpy(&change, event->payload, sizeof(change));
+            cJSON_AddStringToObject(
+                doc,
+                "state",
+                change.link_state == WLH_HOST_ETH_LINK_STATE_UP ? "up" : "down"
+            );
+            cJSON_AddNumberToObject(doc, "speed", change.speed);
+            cJSON_AddNumberToObject(doc, "duplex", change.duplex);
+        }
+        wlh_repl_json_emit(doc);
         break;
     case WLH_HOST_EVENT_USER_MESSAGE_RESULT:
         doc = wlh_repl_json_begin("user_message_result");

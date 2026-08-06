@@ -251,6 +251,92 @@ static void ota_tx_ready(void *context) {
     pthread_mutex_unlock(&app->state_mutex);
 }
 
+/* READY-time wired-ETH probe completion. Runs on the adapter executor thread
+ * (same context as host_event; see the probe call site there). A peer without
+ * the ETH service (e.g. ESP32-S3 Wi-Fi firmware) fails the RPC with
+ * WLH_HOST_PROTOCOL_ERROR/WLH_STATUS_NOT_SUPPORTED and this returns without
+ * touching any state, leaving the Wi-Fi flow untouched. */
+static void eth_get_info_completion(
+    void *context,
+    wlh_host_result_t result,
+    uint16_t domain,
+    int16_t status,
+    const wlh_host_eth_info_t *info
+) {
+    app_t *app = context;
+    static const uint8_t zero_mac[6] = {0u};
+    bool first_detect = false;
+    bool link_up = false;
+    bool link_down = false;
+    uint8_t mac[6] = {0u};
+
+    if (result != WLH_HOST_OK || info == NULL ||
+        memcmp(info->mac_address, zero_mac, sizeof(zero_mac)) == 0) {
+        WLH_LOGI(
+            "host-sim",
+            "wired ETH probe result=%d domain=%u status=%d; staying in "
+            "Wi-Fi mode",
+            result,
+            domain,
+            status
+        );
+        return;
+    }
+
+    pthread_mutex_lock(&app->state_mutex);
+    if (!atomic_load(&app->eth_mode)) {
+        atomic_store(&app->eth_mode, true);
+        first_detect = true;
+    }
+    if (info->link_state == WLH_HOST_ETH_LINK_STATE_UP) {
+        link_up = !app->eth_link_up ||
+                  memcmp(app->eth_mac, info->mac_address, sizeof(mac)) != 0;
+        app->eth_link_up = true;
+        app->connected = true;
+        app->disconnected = false;
+    } else {
+        link_down = app->eth_link_up;
+        app->eth_link_up = false;
+        if (link_down) {
+            app->connected = false;
+            app->disconnected = true;
+        }
+    }
+    memcpy(app->eth_mac, info->mac_address, sizeof(app->eth_mac));
+    memcpy(mac, info->mac_address, sizeof(mac));
+    pthread_cond_broadcast(&app->state_changed);
+    pthread_mutex_unlock(&app->state_mutex);
+
+    if (first_detect)
+        WLH_LOGI(
+            "host-sim",
+            "wired ETH service detected "
+            "mac=%02x:%02x:%02x:%02x:%02x:%02x speed=%d duplex=%d link=%s; "
+            "entering eth_mode",
+            mac[0],
+            mac[1],
+            mac[2],
+            mac[3],
+            mac[4],
+            mac[5],
+            (int)info->speed,
+            (int)info->duplex,
+            info->link_state == WLH_HOST_ETH_LINK_STATE_UP ? "up" : "down"
+        );
+    /* A GET_INFO snapshot reporting link UP is applied directly instead of
+     * waiting for a WLH_HOST_EVENT_ETH_LINK_STATE_CHANGED that may already
+     * have fired before the probe completed. sim_network_link_up starts the
+     * same DHCP flow as the WIFI_CONNECTED path. */
+    if (link_up && app->network != NULL) {
+        if (sim_network_link_up(app->network, mac) != 0)
+            WLH_LOGW("host-sim", "failed to bring lwIP netif up");
+    }
+    if (link_down && app->network != NULL)
+        sim_network_link_down(app->network);
+    if (link_down && app->iperf != NULL)
+        wlh_iperf_cancel(app->iperf, "wired ETH link down");
+}
+
 static void usb_on_frame(void *context, const uint8_t *frame, size_t size) {
     app_t *app = context;
     (void)wlh_host_on_frame(&app->host, frame, size);
@@ -349,6 +435,7 @@ static void host_event(void *context, const wlh_host_event_t *event) {
     app_t *app = context;
     bool link_up = false;
     bool link_down = false;
+    bool probe_eth = false;
     uint8_t interface_mac[6] = {0};
     pthread_mutex_lock(&app->state_mutex);
     if (event->kind == WLH_HOST_EVENT_WIFI_SCAN_COMPLETED)
@@ -371,15 +458,39 @@ static void host_event(void *context, const wlh_host_event_t *event) {
         app->disconnected = true;
         link_down = true;
     }
-    if (event->kind == WLH_HOST_EVENT_ETHERNET_STA_RX) {
+    if (event->kind == WLH_HOST_EVENT_ETHERNET_STA_RX ||
+        event->kind == WLH_HOST_EVENT_ETHERNET_ETH_RX) {
         app->ethernet_rx = true;
         if (app->network != NULL)
             (void)sim_network_input(
                 app->network, event->payload, event->payload_size
             );
     }
+    if (event->kind == WLH_HOST_EVENT_ETH_LINK_STATE_CHANGED &&
+        atomic_load(&app->eth_mode) &&
+        event->payload_size >= sizeof(wlh_host_eth_link_state_event_t)) {
+        wlh_host_eth_link_state_event_t change;
+        memcpy(&change, event->payload, sizeof(change));
+        if (change.link_state == WLH_HOST_ETH_LINK_STATE_UP) {
+            link_up = !app->eth_link_up;
+            app->eth_link_up = true;
+            app->connected = true;
+            app->disconnected = false;
+            memcpy(interface_mac, app->eth_mac, sizeof(interface_mac));
+        } else if (change.link_state == WLH_HOST_ETH_LINK_STATE_DOWN) {
+            link_down = app->eth_link_up;
+            app->eth_link_up = false;
+            if (link_down) {
+                app->connected = false;
+                app->disconnected = true;
+            }
+        }
+    }
     if (event->kind == WLH_HOST_EVENT_USER_MESSAGE_RESULT)
         app->user_result_received = true;
+    if (event->kind == WLH_HOST_EVENT_STATE_CHANGED &&
+        event->state == WLH_HOST_STATE_READY)
+        probe_eth = true;
     if (event->kind == WLH_HOST_EVENT_STATE_CHANGED &&
         event->state != WLH_HOST_STATE_READY)
         app->ota_left_ready = true;
@@ -394,7 +505,23 @@ static void host_event(void *context, const wlh_host_event_t *event) {
     if (link_down && app->network != NULL)
         sim_network_link_down(app->network);
     if (link_down && app->iperf != NULL)
-        wlh_iperf_cancel(app->iperf, "Wi-Fi link disconnected");
+        wlh_iperf_cancel(
+            app->iperf,
+            event->kind == WLH_HOST_EVENT_ETH_LINK_STATE_CHANGED
+                ? "wired ETH link down"
+                : "Wi-Fi link disconnected"
+        );
+    /* host_event runs on the adapter executor thread (app->executor):
+     * host-core posts every event and RPC completion to config.executor
+     * (wl-hosted-core host.c dispatch_event/dispatch_completion) and never
+     * invokes on_event inline or with core locks held. Issuing
+     * wlh_host_eth_get_info() here is therefore safe: it only allocates a
+     * request and enqueues an RPC job on the core queue, and the completion
+     * is posted back to this same executor. No extra worker thread needed. */
+    if (probe_eth &&
+        wlh_host_eth_get_info(&app->host, eth_get_info_completion, app) !=
+            WLH_HOST_OK)
+        WLH_LOGW("host-sim", "wired ETH probe request rejected");
     if (event->kind == WLH_HOST_EVENT_WIFI_SCAN_RESULT)
         log_scan_results(event);
     if (event->kind == WLH_HOST_EVENT_OTA_PROGRESS) {
@@ -425,7 +552,8 @@ static void host_event(void *context, const wlh_host_event_t *event) {
      * serializes high-rate UDP receive onto stderr; link errors still log at
      * their source in network_send. */
     if (event->kind != WLH_HOST_EVENT_ETHERNET_STA_RX &&
-        event->kind != WLH_HOST_EVENT_ETHERNET_AP_RX)
+        event->kind != WLH_HOST_EVENT_ETHERNET_AP_RX &&
+        event->kind != WLH_HOST_EVENT_ETHERNET_ETH_RX)
         WLH_LOGI(
             "host-sim",
             "event kind=%d state=%d service=%u method=%u bytes=%zu",
@@ -442,8 +570,13 @@ static int network_send(void *context, const uint8_t *frame, size_t size) {
     app_t *app = context;
     static uint32_t frame_count;
     static uint32_t failure_count;
+    /* eth_mode selects the wired-ETH data channel (ETHERNET_ETH); Wi-Fi
+     * firmware keeps the STA channel. eth_mode only transitions false->true
+     * after a successful probe, before the netif ever comes up in ETH mode. */
     wlh_host_result_t result =
-        wlh_host_ethernet_sta_send(&app->host, frame, size);
+        atomic_load(&app->eth_mode)
+            ? wlh_host_ethernet_eth_send(&app->host, frame, size)
+            : wlh_host_ethernet_sta_send(&app->host, frame, size);
     ++frame_count;
     if (result != WLH_HOST_OK)
         ++failure_count;

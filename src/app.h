@@ -76,6 +76,13 @@ typedef struct app {
     bool disconnected;
     bool ethernet_rx;
     bool user_result_received;
+    /* Wired-ETH mode. eth_mode is set once the READY-time ETH GET_INFO probe
+     * succeeds against the peer firmware; it is atomic because network_send
+     * reads it from the lwIP tcpip thread. eth_link_up and eth_mac are
+     * guarded by state_mutex. */
+    atomic_bool eth_mode;
+    bool eth_link_up;
+    uint8_t eth_mac[6];
 
     uint64_t started_ms;
     uint32_t monitor_interval_ms;
