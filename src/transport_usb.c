@@ -154,6 +154,56 @@ static libusb_device_handle *open_matching_device(
     return handle;
 }
 
+static int discover_bulk_endpoints(
+    libusb_device_handle *handle,
+    uint8_t interface_number,
+    uint8_t *endpoint_out,
+    uint8_t *endpoint_in
+) {
+    struct libusb_config_descriptor *config = NULL;
+    uint8_t discovered_out = 0u;
+    uint8_t discovered_in = 0u;
+    int status;
+
+    status =
+        libusb_get_active_config_descriptor(libusb_get_device(handle), &config);
+    if (status != 0)
+        return -1;
+    for (uint8_t interface_index = 0u; interface_index < config->bNumInterfaces;
+         ++interface_index) {
+        const struct libusb_interface *interface =
+            &config->interface[interface_index];
+        for (int alternate_index = 0;
+             alternate_index < interface->num_altsetting;
+             ++alternate_index) {
+            const struct libusb_interface_descriptor *alternate =
+                &interface->altsetting[alternate_index];
+            if (alternate->bInterfaceNumber != interface_number)
+                continue;
+            for (uint8_t endpoint_index = 0u;
+                 endpoint_index < alternate->bNumEndpoints;
+                 ++endpoint_index) {
+                const struct libusb_endpoint_descriptor *endpoint =
+                    &alternate->endpoint[endpoint_index];
+                if ((endpoint->bmAttributes & LIBUSB_TRANSFER_TYPE_MASK) !=
+                    LIBUSB_TRANSFER_TYPE_BULK)
+                    continue;
+                if ((endpoint->bEndpointAddress & LIBUSB_ENDPOINT_DIR_MASK) ==
+                    LIBUSB_ENDPOINT_IN)
+                    discovered_in = endpoint->bEndpointAddress;
+                else
+                    discovered_out = endpoint->bEndpointAddress;
+            }
+        }
+    }
+    libusb_free_config_descriptor(config);
+    if (discovered_out == 0u || discovered_in == 0u)
+        return -1;
+    *endpoint_out = discovered_out;
+    *endpoint_in = discovered_in;
+    return 0;
+}
+
 int sim_usb_open(
     sim_usb_transport_t **transport, const sim_usb_config_t *config
 ) {
@@ -196,6 +246,19 @@ int sim_usb_open(
         return -1;
     }
 
+    if (discover_bulk_endpoints(
+            created->handle,
+            config->interface_number,
+            &created->config.endpoint_out,
+            &created->config.endpoint_in
+        ) != 0) {
+        WLH_LOGE("host-sim", "usb bulk endpoints not found");
+        libusb_close(created->handle);
+        libusb_exit(created->context);
+        free(created);
+        return -1;
+    }
+
     if (libusb_kernel_driver_active(
             created->handle, config->interface_number
         ) == 1) {
@@ -225,10 +288,12 @@ int sim_usb_open(
 
     WLH_LOGI(
         "host-sim",
-        "usb opened %04x:%04x interface=%u",
+        "usb opened %04x:%04x interface=%u out=0x%02x in=0x%02x",
         config->vendor_id,
         config->product_id,
-        config->interface_number
+        config->interface_number,
+        created->config.endpoint_out,
+        created->config.endpoint_in
     );
     *transport = created;
     return 0;
