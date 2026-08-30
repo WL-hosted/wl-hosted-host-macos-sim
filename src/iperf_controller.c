@@ -216,6 +216,7 @@ static bool send_udp_server_report(
 ) {
     uint8_t report[WLH_IPERF2_DEFAULT_UDP_PACKET_SIZE] = {0};
     uint8_t received[WLH_IPERF2_DEFAULT_UDP_PACKET_SIZE];
+    bool report_sent = false;
     uint32_t attempt;
     if (!wlh_iperf2_udp_encode_server_report(
             report, sizeof(report), bytes, elapsed_ms, stats
@@ -233,8 +234,14 @@ static bool send_udp_server_report(
             (const struct sockaddr *)peer,
             peer_size
         );
-        if (sent != (int)sizeof(report))
+        if (sent != (int)sizeof(report)) {
+            if (send_backpressured()) {
+                sys_msleep(IPERF_UDP_ACK_WAIT_MS);
+                continue;
+            }
             return false;
+        }
+        report_sent = true;
         ready = wait_ready(fd, false, IPERF_UDP_ACK_WAIT_MS);
         if (ready < 0)
             return false;
@@ -245,7 +252,7 @@ static bool send_udp_server_report(
         }
         (void)lwip_recvfrom(fd, received, sizeof(received), 0, NULL, NULL);
     }
-    return !cancelled(controller);
+    return report_sent && !cancelled(controller);
 }
 static void *worker_main(void *argument) {
     struct wlh_iperf_controller *controller = argument;
@@ -478,7 +485,7 @@ static void *worker_main(void *argument) {
                             udp.bytes,
                             elapsed_ms,
                             &udp,
-                            true
+                            false
                         )) {
                         detail = "failed to send UDP server report";
                         break;
@@ -534,7 +541,7 @@ static void *worker_main(void *argument) {
                 if (count != (int)packet_size) {
                     if (!send_backpressured())
                         break;
-                    sys_msleep(1u);
+                    sys_msleep(IPERF_UDP_ACK_WAIT_MS);
                     continue;
                 }
                 int ready = wait_ready(data_fd, false, IPERF_UDP_ACK_WAIT_MS);
