@@ -33,6 +33,10 @@ typedef struct tx_work {
     void *completion_context;
 } tx_work_t;
 
+#define USB_TX_BATCH_MAX_FRAMES 4u
+#define USB_TX_BATCH_MAX_BYTES (16u * 1024u)
+#define USB_TX_STATS_INTERVAL_MS 30000u
+
 typedef struct lifecycle_work {
     app_t *app;
     bool is_start;
@@ -49,6 +53,7 @@ static int send_protobuf(
     const void *message,
     size_t maximum
 );
+static void tx_work_run(void *context);
 
 uint64_t wlh_app_monotonic_ms(void) {
     struct timespec value;
@@ -113,18 +118,96 @@ static int transport_stop(
 ) {
     return submit_lifecycle(context, completion, completion_context, false);
 }
+static tx_work_t *take_adjacent_usb_tx(app_t *app, size_t available) {
+    sim_executor_t *executor = &app->tx_executor;
+    tx_work_t *work = NULL;
+
+    pthread_mutex_lock(&executor->mutex);
+    if (executor->count != 0u) {
+        sim_task_t *task = &executor->queue[executor->head];
+        tx_work_t *candidate = task->context;
+
+        /* Never cross a lifecycle or other executor task.  Transport order is
+         * part of the Core contract, so only consecutive TX submissions may
+         * share a USB transfer. */
+        if (task->function == tx_work_run && candidate->size <= available) {
+            work = candidate;
+            executor->head = (executor->head + 1u) % 64u;
+            executor->count--;
+        }
+    }
+    pthread_mutex_unlock(&executor->mutex);
+    return work;
+}
+
+static void complete_tx_work(tx_work_t *work, int status) {
+    work->completion(work->completion_context, work->frame, work->size, status);
+    free(work);
+}
+
+static void report_usb_tx_stats(
+    app_t *app, size_t batch_frames, size_t batch_bytes
+) {
+    uint64_t now = wlh_app_monotonic_ms();
+
+    app->usb_tx_batch_count++;
+    app->usb_tx_frame_count += batch_frames;
+    app->usb_tx_byte_count += batch_bytes;
+    if (batch_frames > app->usb_tx_max_batch_frames)
+        app->usb_tx_max_batch_frames = (unsigned)batch_frames;
+    if (batch_bytes > app->usb_tx_max_batch_bytes)
+        app->usb_tx_max_batch_bytes = batch_bytes;
+    if (now - app->usb_tx_last_report_ms < USB_TX_STATS_INTERVAL_MS)
+        return;
+    app->usb_tx_last_report_ms = now;
+    WLH_LOGI(
+        "host-sim",
+        "USB TX stats: batches=%llu frames=%llu bytes=%llu max=%u/%zu",
+        (unsigned long long)app->usb_tx_batch_count,
+        (unsigned long long)app->usb_tx_frame_count,
+        (unsigned long long)app->usb_tx_byte_count,
+        app->usb_tx_max_batch_frames,
+        app->usb_tx_max_batch_bytes
+    );
+}
+
 static void tx_work_run(void *context) {
+    tx_work_t *works[USB_TX_BATCH_MAX_FRAMES];
+    uint8_t batch[USB_TX_BATCH_MAX_BYTES];
     tx_work_t *work = context;
+    size_t count = 1u;
+    size_t size = work->size;
     int status;
+
+    works[0] = work;
     if (work->app->use_usb) {
-        status = sim_usb_write(work->app->usb, work->frame, work->size);
+        while (count < USB_TX_BATCH_MAX_FRAMES && size < sizeof(batch)) {
+            tx_work_t *next =
+                take_adjacent_usb_tx(work->app, sizeof(batch) - size);
+            if (next == NULL)
+                break;
+            works[count++] = next;
+            size += next->size;
+        }
+
+        if (count == 1u) {
+            status = sim_usb_write(work->app->usb, work->frame, work->size);
+        } else {
+            size_t cursor = 0u;
+            for (size_t index = 0u; index < count; ++index) {
+                memcpy(batch + cursor, works[index]->frame, works[index]->size);
+                cursor += works[index]->size;
+            }
+            status = sim_usb_write(work->app->usb, batch, size);
+        }
+        report_usb_tx_stats(work->app, count, size);
     } else {
         status = sim_ipc_write(
             &work->app->ipc, SIM_RECORD_WIRE_FRAME, work->frame, work->size
         );
     }
-    work->completion(work->completion_context, work->frame, work->size, status);
-    free(work);
+    for (size_t index = 0u; index < count; ++index)
+        complete_tx_work(works[index], status);
 }
 
 static int transport_submit(

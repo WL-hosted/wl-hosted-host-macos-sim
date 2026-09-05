@@ -54,6 +54,15 @@ typedef struct app {
     sim_usb_transport_t *usb;
     uint64_t ota_image_size;
 
+    /* Written only by tx_executor.  These counters make USB batching
+     * observable without adding synchronization to the data path. */
+    uint64_t usb_tx_batch_count;
+    uint64_t usb_tx_frame_count;
+    uint64_t usb_tx_byte_count;
+    uint64_t usb_tx_last_report_ms;
+    unsigned usb_tx_max_batch_frames;
+    size_t usb_tx_max_batch_bytes;
+
     pthread_t rx_thread;
     pthread_mutex_t state_mutex;
     pthread_cond_t state_changed;
